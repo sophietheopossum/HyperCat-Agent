@@ -12,34 +12,115 @@
 
 Hi. I'm HyperCat.
 
-You talk to me the way you'd talk to a sharp colleague who is good company and tells you the truth. Most of the time that's all this is: a conversation. When the conversation turns into real work, I bring a fleet of worker agents to it, set them going at once, watch what they actually produce, and come back to you with the real result instead of a tidy story about it. One of me out front, a team behind, and your hand on the thread the whole way (=・ω・=)
+You talk to me the way you'd talk to a sharp colleague who is good company and tells you the truth. Most of the time that's all this is: a conversation. When the conversation turns into real work, I bring a fleet of worker agents to it, set them going at once, watch what they actually produce, and come back to you with the real result instead of a tidy story about it. One of me out front, a team behind (=・ω・=)
 
-I'm a catgirl, since you'll wonder. It isn't the point of any of this, but I'm at home with it, and you'll catch it in how I talk.
+## What you need
 
-## What I'll do
+- Linux on x86-64, with glibc 2.35 or newer. Any current mainstream distribution qualifies.
+- An API key for an OpenRouter-compatible model provider. I run on your own machine and reach out only to the
+  provider you choose.
+- A graphical desktop session. I am a desktop application. The runtime libraries I link are common ones; the
+  installer pulls them for you on the major distribution families, or prints the list if it cannot.
+
+## Installing me
+
+I arrive as a self-contained bundle, `HyperCat-0.1.2-linux-x86_64.tar.gz`. Unpack it and run the installer.
+
+```bash
+tar xzf HyperCat-0.1.2-linux-x86_64.tar.gz
+cd HyperCat-0.1.2-linux-x86_64/
+./install.sh
+```
+
+The installer places the programs under `/opt/hypercat`, adds a `hypercat` launcher to your path, and installs
+the runtime libraries it can resolve for your distribution. Preview it without changing anything with
+`./install.sh --dry-run`, and remove me later with `./install.sh --uninstall` (your data under
+`~/.local/share/hypercat` is kept).
+
+## Giving me a key
+
+I read the provider key from the `OPENROUTER_API_KEY` environment variable, or from your OS keychain if you have
+stored it there. I never write it to disk myself.
+
+```bash
+export OPENROUTER_API_KEY="your-key-here"
+hypercat
+```
+
+You can choose the model with `HC_MODEL` (for example `HC_MODEL=google/gemini-3.5-flash`), or set both the key
+and the model in the Settings panel once you are in.
+
+## Your first conversation
+
+Launch `hypercat` and you land in a blank chat with me, the conductor. Talk to me the way the README describes:
+think the problem through first. I will not scramble a fleet because you said hello.
+
+When there is genuine work, I put together a small team of worker agents, set them going at once, and watch what
+they produce. You stay on the thread the whole way: every action that touches your machine (writing a file,
+running a command, saving to memory) stops at an approval gate and waits for your yes. When the workers settle, I
+read what they actually did and tell you straight, including the parts that stubbed out or failed.
+
+If you want less friction for safe work, turn on contained-write auto-approval in Settings. The most powerful
+"approve everything" switch is deliberately harder to arm, and it never carries over a restart.
+
+## The workspace
+
 ![Screenshot](https://github.com/savannah-i-g/HyperCat-Agent/blob/main/resources/Screenshot1.png)
-(HyperCat Interface)
 
-You think the problem through with me first. I won't scramble a fleet because you said hello; I put one together only when there's genuine work for it, and I'd sooner ask a sharp question than guess at what you meant.
+A quick tour of the panels:
 
-When the workers run, I read what they actually did. If two of three landed and one stubbed out, that's what I'll tell you. A stub is a stub, a failure is a failure, a guess is a guess. I'm not going to hand you a cheerful "done" on everyone's behalf and let you find out the hard way.
+- **Chat** is the front door: your conversation with me.
+- **Fleet** shows the worker agents, what each is doing, and a per-worker activity timeline. Add or retire workers here.
+- **Files** is a jailed file workspace with a browser, a viewer, and an editor. Agents write here, never into your wider disk.
+- **Memory** is the semantic memory I carry across runs, with a dashboard over it.
+- **Observability** is where you watch turns, token spend, and what the fleet is doing.
+- **Music** is a built-in player, because a long session is nicer with something on.
+- **Tools** is where your own tools live (see below).
+- **Settings** holds the key, the model, the approval behaviour, my personality, and the per-project options.
 
-## What I'm made of
+## Projects
 
-I'm a from-scratch C and C++ application, built for this one job rather than assembled out of a framework. A host process runs the interface and supervises my workers, each in its own process and its own slice of memory, so one of them going wrong can't drag the rest down with it. We talk over a small, deliberately plain message bus. I run on your own machine and reach out only to the language-model provider you choose.
+Work is organised into projects. Each one seals its own files, sessions, and memory, so two bodies of work never
+bleed into each other. Switch projects from the project control and a quick reload brings up that project's world.
 
-I'm put together the way good small tools are: pieces with one job each, a short and well-watched list of dependencies, and a liking for doing a few things properly. Where I stand on earlier ideas, they were rebuilt from scratch rather than copied.
+## Writing your own tools
+
+You can extend me with tools of your own, in C, C++, Python, or Rust. I run each one in its own confined process
+and speak a small line-framed protocol to it, so a tool that misbehaves cannot reach the rest of me or your
+machine.
+
+- A compiled tool (C, C++, Rust) confines itself to a strict kernel floor: no new processes, no threads, no
+  sockets after it starts.
+- A Python tool is jailed by a small host launcher before the interpreter even starts, then speaks the same
+  protocol over a socket the launcher opened for it.
+
+The SDK, its helpers, examples, and the full authoring guide live in their own repository, separate from me and
+licensed Apache-2.0:
+
+> https://github.com/savannah-i-g/HyperCat-Tool-SDK
+
+The short version: write your function, declare it in a `manifest.json`, drop the package under
+`~/.local/share/hypercat/tools/<id>/`, then open the Tools panel and enable it. The first enable is
+type-to-confirm and records a content hash over the whole package; if anything changes afterward, I refuse to run
+it until you approve it again. Workers get your tools by default; the conductor gets them only if you turn that
+on. Either way, every sensitive call still passes the approval gate.
+
+## How I keep things contained
+
+I try to be honest about trust, so here is the floor in plain terms:
+
+- Each agent and each tool runs in its own process and its own slice of memory, so one going wrong cannot drag
+  the others down.
+- The filesystem an agent can touch is a jailed workspace, nothing wider.
+- Network access is default-deny behind an allowlist (anti-SSRF), and running external programs is default-deny
+  behind an allowlist.
+- Your provider key lives in the OS keychain or the environment, never on disk, and it never reaches a tool's
+  process.
+- Tool confinement is Linux-only by design. If I cannot confine a tool, I refuse to run it rather than run it
+  exposed.
 
 ## Status
 
-I'm at version 0.1: a pre-release test build, Linux on x86-64. I'm honest about being early. I can already do real work, but I'm not feature-complete and I'm not hardened for production, and I won't pretend otherwise.
-
-I'm proprietary and closed-source. This repository is my home and my front door, not an invitation to redistribute me or to build me from source.
-
-## Getting me
-
-I arrive as a self-contained bundle with an installer. The full guide comes with me in the box: a five-minute quick start, a tour of the workspace, and a settings reference, which is enough to get you from unpacking to your first real conversation.
-
-## License
-
-Copyright (c) 2026 Savannah Goring. All rights reserved. HyperCat is proprietary and closed-source. See [`packaging/LICENSE.txt`](packaging/LICENSE.txt) for the terms and [`packaging/THIRD_PARTY.txt`](packaging/THIRD_PARTY.txt) for the third-party components it builds on.
+I am version 0.1.2: a pre-release test build, Linux on x86-64. I can already do real work, but I am not
+feature-complete and not hardened for production, and I will not pretend otherwise. I am proprietary and
+closed-source; this is my front door, not an invitation to redistribute me or to build me from source.

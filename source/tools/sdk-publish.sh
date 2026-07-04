@@ -53,7 +53,8 @@ cat > "$TARGET/README.md" <<'README'
 
 Build your own tools for HyperCat — in C, C++, Python, or Rust — and HyperCat runs them as confined,
 operator-approved subprocesses. This is the SDK only, licensed Apache-2.0. HyperCat itself (the application) is
-separate software and is not part of this repository.
+separate software, published in its own repository
+([HyperCat-Agent](https://github.com/savannah-i-g/HyperCat-Agent), also Apache-2.0).
 
 A tool is a small program that speaks a tiny line-framed JSON protocol over a Unix-domain socket: it checks in,
 gets confined to a least-privilege kernel sandbox (Landlock + seccomp), and answers tool calls. The SDK does the

@@ -1,0 +1,13 @@
+# Tier-2 proof image: a Debian base that DELIBERATELY omits libcjson-dev, forcing hc_json's
+# FetchContent fallback (W1) to fetch + build the pinned cJSON and exercise the include-dir shim.
+# If this row is green, a distro that doesn't package cJSON still builds.
+ARG BASE=debian:12
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config git ca-certificates \
+      libcurl4-openssl-dev libglfw3-dev libopenal-dev libgl1-mesa-dev libx11-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/build-and-test.sh"]

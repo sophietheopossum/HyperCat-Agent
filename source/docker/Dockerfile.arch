@@ -1,0 +1,13 @@
+# Arch / Manjaro (pacman) build environment. Rolling release — treat a red row here as an early
+# warning that upstream ImGui/GLFW/compiler moved, not necessarily that HyperCat regressed. Arch has
+# no split -dev packages: curl/cjson/glfw/openal/mesa/libx11 each carry their headers. base-devel
+# brings gcc/make/pkgconf.
+ARG BASE=archlinux:latest
+FROM ${BASE}
+RUN pacman -Syu --noconfirm --needed \
+      base-devel cmake ninja git \
+      curl cjson glfw openal mesa libx11 libsecret \
+    && pacman -Scc --noconfirm
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/build-and-test.sh"]

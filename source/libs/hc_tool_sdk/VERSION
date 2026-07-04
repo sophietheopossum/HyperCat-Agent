@@ -1,0 +1,7 @@
+hypercat-tool-sdk 1.0
+HC_TOOL_ABI_VERSION 1
+built against HyperCat 0.1.0
+
+The SDK version tracks the tool ABI / wire protocol (HC_TOOL_ABI_VERSION), not the
+HyperCat application version. A tool built against SDK 1.0 keeps working with any
+HyperCat host that speaks tool-protocol v1.

@@ -1,0 +1,23 @@
+# HyperCat static analysis. Security- and correctness-leaning; magic-number / identifier-length
+# noise disabled. C++-only checks are simply inert on C translation units.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-avoid-non-const-global-variables
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/(libs|app|agentd)/.*'
+FormatStyle: file

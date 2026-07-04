@@ -1,0 +1,13 @@
+# Fedora (dnf) build environment. Parameterized by BASE: --build-arg BASE=fedora:41 | fedora:42.
+# cjson-devel / glfw-devel / openal-soft-devel are in Fedora proper (no EPEL needed — that's the
+# RHEL/Rocky/Alma case, see Dockerfile.enterprise).
+ARG BASE=fedora:41
+FROM ${BASE}
+RUN dnf -y install \
+      gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git-core ca-certificates \
+      libcurl-devel cjson-devel glfw-devel openal-soft-devel libsecret-devel \
+      mesa-libGL-devel libX11-devel \
+    && dnf clean all
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/build-and-test.sh"]

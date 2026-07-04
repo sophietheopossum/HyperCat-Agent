@@ -1,0 +1,10 @@
+# Keep the build context lean: exclude build trees, fetched deps, and release output, so
+# `podman/docker build` (which COPYs the source into each matrix image) stays fast.
+build/
+build-*/
+_deps/
+dist/
+*.tar.gz
+*.tar.gz.sha256
+.cache/
+.git/

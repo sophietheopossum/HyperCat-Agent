@@ -1,0 +1,31 @@
+# The glibc-FLOOR builder. Ubuntu 22.04 = glibc 2.35 — the lowest CLEAN, currently-supported glibc that
+# has everything the build needs out of the box: the Landlock syscall macros (SYS_landlock_*, glibc >=2.34),
+# the landlock.h UAPI header (kernel-headers 5.15 >= 5.13), the STATIC libstdc++ (build-essential ships
+# libstdc++.a), and cmake 3.22 (>= our 3.20 floor). The Release binary it links references no symbol newer
+# than GLIBC_2.35, so it runs forward-compatibly on any glibc >= 2.35 distro — Ubuntu 22.04+, Debian 12+,
+# Fedora 36+, Arch, openSUSE Leap 15.4+ — AND on RHEL/Alma/Rocky 9.x (whose "2.34" glibc backports the
+# GLIBC_2.35 symbol versions; the run-on-newer AlmaLinux 9 check in tools/floor-build.sh proves it loads).
+#
+# Why not glibc 2.34 (AlmaLinux 9 as builder): RHEL-family glibc backports newer symbol versions, so a
+# binary built there actually references GLIBC_2.35 anyway — same effective floor, but with EPEL/CRB +
+# a separate libstdc++-static package. Ubuntu 22.04 is the cleaner, simpler 2.35 floor. Why not glibc 2.31
+# (Debian 11 / Ubuntu 20.04): those predate SYS_landlock_* -> the confinement code won't COMPILE there
+# without a source guard (deferred — see EXPANSIONS/STATE).
+ARG BASE=docker.io/library/ubuntu:22.04
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+# libcjson-dev is deliberately OMITTED: with no system cJSON, hc_json's FetchContent fallback (W1) builds
+# cJSON STATICALLY into the binary, so the floor bundle carries NO libcjson.so.1 runtime dependency — it
+# then runs even on distros that don't package cJSON (e.g. openSUSE Leap). One fewer soname to resolve.
+# libsecret-1-dev IS included (unlike cjson) so the flagship floor binary carries the OS keychain backend
+# (the "on by default" decision). It adds libsecret-1.so.0 + libglib-2.0.so.0 + libgobject-2.0.so.0 as runtime
+# sonames (universally packaged at/above the floor — install.sh + the run-on-newer check provide them) and
+# references no symbol > GLIBC_2.35, so the floor symbol-ceiling assertion still holds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config git ca-certificates binutils file \
+      libcurl4-openssl-dev libglfw3-dev libopenal-dev libsecret-1-dev \
+      libgl1-mesa-dev libx11-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/floor-package.sh"]

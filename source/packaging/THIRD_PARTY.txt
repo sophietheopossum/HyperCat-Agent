@@ -1,0 +1,40 @@
+HyperCat - Third-Party Components
+=================================
+
+HyperCat is open-source under the Apache License 2.0 and builds on other
+open-source components. This notice acknowledges them and their licenses. Full license texts are available from each
+project; for this test build the license type is listed.
+
+COMPILED INTO THE BINARIES (statically linked)
+  Dear ImGui (docking branch)   - MIT License - github.com/ocornut/imgui
+                                   the user-interface toolkit
+  stb_image                     - Public Domain / MIT - github.com/nothings/stb
+                                   PNG/JPEG decoding (asset processing)
+  dr_wav, dr_mp3, dr_flac       - Public Domain (Unlicense) / MIT-0
+                                   github.com/mackron/dr_libs (audio decoding)
+  stb_vorbis                    - Public Domain / MIT - github.com/nothings/stb
+                                   Ogg Vorbis decoding
+  QOI (qoi.h)                   - MIT License - github.com/phoboslab/qoi
+                                   the "Quite OK Image" format for bundled art
+
+LINKED DYNAMICALLY (system libraries, installed via your package manager)
+  libcurl                       - curl license (MIT/X-derivative) - curl.se
+  GLFW                          - zlib/libpng License - glfw.org
+  OpenAL Soft                   - LGPL v2.1 - openal-soft.org
+                                   (used via dynamic linking, per the LGPL)
+  cJSON                         - MIT License - github.com/DaveGamble/cJSON
+  libsecret                     - LGPL v2.1 - wiki.gnome.org/Projects/Libsecret
+                                   (OS keyring access; via dynamic linking, per the LGPL)
+  GLib (glib-2.0, gobject-2.0)  - LGPL v2.1 - gitlab.gnome.org/GNOME/glib
+                                   (a dependency of libsecret)
+  OpenGL / GLVND, X11, ALSA, zlib, GnuTLS/OpenSSL and other standard system
+  runtime libraries             - their respective open-source licenses
+
+FONTS (installed via your package manager; not redistributed in this bundle)
+  JetBrains Mono                - SIL Open Font License 1.1
+  Noto Sans CJK                 - SIL Open Font License 1.1
+  DejaVu                        - DejaVu Fonts License (Bitstream Vera-derived)
+
+The HyperCat application code is licensed under the Apache License 2.0; see
+LICENSE.txt. The HyperCat name and the bundled mascot artwork are brand assets,
+and the license does not grant rights to use them as trademarks.

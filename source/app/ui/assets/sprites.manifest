@@ -1,0 +1,40 @@
+# HyperCat sprite manifest — consumed by tools/qoi_pack -> app/ui/assets/sprite_assets.h (the committed,
+# embedded QOI catalog the UI sprite registry decodes). One sheet per line; '#' comments and blank lines are
+# ignored. Whitespace-separated columns:
+#
+#   name  src_png  cols  rows  fps  loop  mono_invert
+#
+#   name        : stable catalog key ('.' / '-' become '_' in the generated C symbol)
+#   src_png     : a file under the png_dir passed to qoi_pack (Docs/resources/)
+#   cols rows   : the frame grid (frame_w/h are DERIVED as tex/cols, tex/rows — the manifest can't drift)
+#   fps         : playback rate; 0 = a single still frame
+#   loop        : once | loop | pingpong (ignored for a still)
+#   mono_invert : 1 = map near-black line art -> white-on-transparent (the dark-UI treatment), else 0
+#
+# Regenerate after editing:  cmake --build build --target regen_sprite_assets   (or run qoi_pack by hand).
+#
+# S0 = the existing mascot art, migrated off the hand-edited mascot_assets.h (a ZERO-behaviour change — the
+# mascot is pixel-identical). The in-chat 96x96 conductor sheets (Docs/resources/hypercat_embed_face_*) are
+# added here in S2, when the conductor chat panel renders them.
+
+# mascot.body (full body) + mascot.face80 (compact face) are RESERVED for future mascot moods / a compact-corner
+# mode — packed but not yet drawn (the live consumer uses only mascot.face + mascot.think). Carried forward from
+# the original WI-5 art set; drop these two rows + regenerate if they stay unused.
+mascot.body    hypercat_mascot_128.png                1  1  0  once  1
+mascot.face80  hypercat_mascot_face_80x68.png         1  1  0  once  1
+mascot.face    hypercat_mascot_face_128.png           1  1  0  once  1
+mascot.think   hypercat_mascot_think_128_6frames.png  6  1  9  loop  1
+
+# Conductor P5-S2: the in-chat avatar (96x96) + the tool cue (128x128). Same near-black-line-art -> white
+# treatment as the mascot (mono_invert=1, so the grayscale line art reads on the near-black panels). The
+# AVATAR reflects the conductor's conversational phase — base is the resting still; messagereceived loops
+# while a turn is in flight; messagesent plays ONCE as the reply settles; taskagendadispatch loops while
+# run_agenda dispatches the fleet. The TOOL CUE shows the running tool's kind (read-explore / write /
+# generic — generic is the fallback for any tool without dedicated art).
+conductor.base                hypercat_embed_face_96x96.png                              1   1   0  once  1
+conductor.messagereceived     hypercat_embed_face_messagereceived_96x96_10frames.png     10  1  12  loop  1
+conductor.messagesent         hypercat_embed_face_messagesent_96x96_10frames.png         10  1  12  once  1
+conductor.taskagendadispatch  hypercat_embed_face_taskagendadispatch_96x96_10frames.png  10  1  12  loop  1
+conductor.tool.read           hypercat_embed_face_toolreadexplore_128x128_10frames.png   10  1  12  loop  1
+conductor.tool.write          hypercat_embed_face_toolwrite_128x128_10frames.png         10  1  12  loop  1
+conductor.tool.generic        hypercat_embed_face_toolgeneric_128x128_10frames.png       10  1  12  loop  1

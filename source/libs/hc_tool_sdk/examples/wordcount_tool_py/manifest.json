@@ -1,0 +1,30 @@
+{
+  "manifest_version": 1,
+  "id": "wordcount-py",
+  "name": "Word Count (Python)",
+  "description": "Counts the words in a string. A managed-runtime (Python) example tool.",
+  "author": "HyperCat Tool SDK examples",
+  "version": "1.0.0",
+  "runtime": { "mode": "managed", "interpreter": "python3", "entry": "tool.py" },
+  "tools": [
+    {
+      "name": "word_count",
+      "spec_json": {
+        "type": "function",
+        "function": {
+          "name": "word_count",
+          "description": "Count the whitespace-separated words in a text string.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string", "description": "The text to count words in." }
+            },
+            "required": ["text"]
+          }
+        }
+      }
+    }
+  ],
+  "permissions": { "fs": { "mode": "none" } },
+  "limits": { "timeout_ms": 5000 }
+}

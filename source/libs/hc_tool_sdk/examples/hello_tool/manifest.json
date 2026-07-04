@@ -1,0 +1,24 @@
+{
+  "manifest_version": 1,
+  "id": "hello",
+  "name": "Hello",
+  "description": "A read-only example HyperCat tool that returns a greeting. Grants nothing.",
+  "author": "HyperCat SDK",
+  "version": "0.1.0",
+  "tools": [
+    {
+      "name": "hello",
+      "sensitive": false,
+      "spec_json": {
+        "type": "function",
+        "function": {
+          "name": "hello",
+          "description": "Return a friendly greeting.",
+          "parameters": { "type": "object", "properties": {} }
+        }
+      }
+    }
+  ],
+  "permissions": { "fs": { "mode": "none" }, "egress_hosts": [], "exec_allow": [] },
+  "limits": { "timeout_ms": 5000, "max_output_bytes": 4096, "cpu_seconds": 5, "mem_bytes": 134217728, "max_files": 64 }
+}

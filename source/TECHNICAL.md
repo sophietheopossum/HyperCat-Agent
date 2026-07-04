@@ -8,9 +8,11 @@
 ![C++](https://img.shields.io/badge/C%2B%2B-0a0a0a?style=flat-square&logo=cplusplus&logoColor=white)
 ![license](https://img.shields.io/badge/license-Apache--2.0-1a1a1a?style=flat-square&labelColor=0a0a0a)
 
-Hi. I'm HyperCat.
+# Using HyperCat
 
-You talk to me the way you'd talk to a sharp colleague who is good company and tells you the truth. Most of the time that's all this is: a conversation. When the conversation turns into real work, I bring a fleet of worker agents to it, set them going at once, watch what they actually produce, and come back to you with the real result instead of a tidy story about it. One of me out front, a team behind (=・ω・=)
+Hi again. The front-page README is where I introduce myself. This one is the practical companion: the part that
+gets you from a downloaded bundle to real work without guessing. I will keep the narrator's voice light here and
+let the steps carry it (=・ω・=)
 
 ## What you need
 
@@ -103,19 +105,6 @@ type-to-confirm and records a content hash over the whole package; if anything c
 it until you approve it again. Workers get your tools by default; the conductor gets them only if you turn that
 on. Either way, every sensitive call still passes the approval gate.
 
-## Building from source
-
-My full application source lives in this repository, under [`source/`](source/), licensed
-Apache-2.0. If you would rather build me than download the bundle,
-[`source/README.md`](source/README.md) has the layout, the dependency list, and the build and
-test commands. The short version:
-
-```bash
-cmake -B build -S source -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/app/hypercat
-```
-
 ## How I keep things contained
 
 I try to be honest about trust, so here is the floor in plain terms:
@@ -133,12 +122,12 @@ I try to be honest about trust, so here is the floor in plain terms:
 ## Status
 
 I am version 0.1.2: a pre-release test build, Linux on x86-64. I can already do real work, but I am not
-feature-complete and not hardened for production, and I will not pretend otherwise. My source is open
-under the Apache License 2.0: read me, build me, adapt me under those terms.
+feature-complete and not hardened for production, and I will not pretend otherwise. My source is published
+under the Apache License 2.0, so you are welcome to read me, build me, and adapt me under those terms.
 
 ## License
 
-Copyright (c) 2026 Savannah Goring. HyperCat is open-source under the Apache License 2.0; see
-[LICENSE](LICENSE) for the terms and [`source/packaging/THIRD_PARTY.txt`](source/packaging/THIRD_PARTY.txt)
-for the third-party components I build on. The HyperCat name and mascot artwork are brand assets, and the
-license does not grant trademark rights.
+Copyright (c) 2026 Savannah Goring. HyperCat is open-source under the Apache License 2.0. See
+[`packaging/LICENSE.txt`](packaging/LICENSE.txt) for the terms and
+[`packaging/THIRD_PARTY.txt`](packaging/THIRD_PARTY.txt) for the third-party components it builds on. The
+HyperCat name and mascot artwork are brand assets; the license does not grant trademark rights.

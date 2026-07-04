@@ -1,0 +1,29 @@
+HyperCat - Test Release Disclaimer
+==================================
+
+This is a PRE-RELEASE TEST BUILD of HyperCat, provided AS IS for
+evaluation only. It is version 0.x, not feature-complete, not hardened for
+production, and not guaranteed to be stable.
+
+NO WARRANTY. To the maximum extent permitted by law, this software is provided
+without warranty of any kind, express or implied, including but not limited to
+the warranties of merchantability, fitness for a particular purpose, and
+non-infringement. You assume all risk arising from its use.
+
+WHAT IT DOES ON YOUR MACHINE
+  • Runs a local UI plus background worker processes, all under YOUR user account.
+  • Stores its data locally under  ~/.local/share/hypercat  (conversations,
+    projects, sessions, memory). Nothing is uploaded to us.
+  • Makes OUTBOUND NETWORK CONNECTIONS to your configured LLM provider
+    (OpenRouter by default, https://openrouter.ai) to answer prompts. Your
+    prompts and the agents' work are sent to that provider under their terms and
+    privacy policy. An egress allowlist restricts where it may connect.
+  • Requires an API key you supply, either through the OPENROUTER_API_KEY
+    environment variable or in the application. The key is held in memory or,
+    if you choose to save it, your operating system's keyring; HyperCat never
+    writes it to a plaintext config file and never passes it on a command line.
+
+NOT FOR: production workloads, untrusted multi-user machines, or processing data
+you are not permitted to send to a third-party LLM provider.
+
+By installing and running this build you acknowledge the above.

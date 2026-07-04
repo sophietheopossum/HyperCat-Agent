@@ -1,0 +1,21 @@
+# RHEL-family enterprise (dnf + EPEL + CRB) build environment: Rocky / Alma / RHEL 9.
+#   --build-arg BASE=rockylinux:9 | almalinux:9
+# cjson-devel, glfw-devel, openal-soft-devel live in EPEL (not base); mesa/X11 -devel need the CRB
+# ("CodeReady Builder", called powertools on 8.x) repo. This is the one family that needs extra repos
+# enabled first — which is why it has its own Dockerfile. If a dev package is still missing on a given
+# minor, hc_json's FetchContent fallback (W1) still lets the build succeed.
+ARG BASE=rockylinux:9
+FROM ${BASE}
+RUN dnf -y install dnf-plugins-core epel-release ca-certificates \
+    && { dnf config-manager --set-enabled crb \
+         || dnf config-manager --set-enabled powertools \
+         || dnf config-manager --set-enabled codeready-builder-for-rhel-9-$(uname -m)-rpms \
+         || true; } \
+    && dnf -y install \
+         gcc gcc-c++ cmake ninja-build pkgconf-pkg-config git-core \
+         libcurl-devel cjson-devel glfw-devel openal-soft-devel libsecret-devel \
+         mesa-libGL-devel libX11-devel \
+    && dnf clean all
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/build-and-test.sh"]

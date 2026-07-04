@@ -1,0 +1,14 @@
+# Debian/Ubuntu (apt) build environment. Parameterized by BASE so one file serves the whole apt family:
+#   --build-arg BASE=ubuntu:22.04 | ubuntu:24.04 | debian:12 | linuxmint...
+# ca-certificates is required for the ImGui FetchContent clone over HTTPS at configure time.
+ARG BASE=ubuntu:22.04
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config git ca-certificates \
+      libcurl4-openssl-dev libcjson-dev libglfw3-dev libopenal-dev libsecret-1-dev \
+      libgl1-mesa-dev libx11-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/build-and-test.sh"]

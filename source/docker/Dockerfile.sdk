@@ -1,0 +1,18 @@
+# The Tool SDK builder — produces the redistributable hypercat-tool-sdk bundle at the glibc FLOOR.
+# Ubuntu 22.04 = glibc 2.35 (the same floor + rationale as Dockerfile.floor): the SDK code references no symbol
+# newer than GLIBC_2.35, so the prebuilt libhc_tool_sdk.a links into a tool author's binary on any glibc >= 2.35.
+#
+# Deliberately LEAN vs the app floor image: the SDK static lib links NO GUI/network/audio libraries (only
+# libc + the Landlock/seccomp syscalls of hc_confine), so the GUI/curl/openal/secret -dev packages are omitted.
+# libcjson-dev is omitted too: with no system cJSON, hc_json's FetchContent fallback (forced ON via
+# HC_JSON_FORCE_FETCH in sdk-package.sh) builds cJSON STATICALLY into the fat lib — self-contained, no
+# libcjson.so dependency for the author.
+ARG BASE=docker.io/library/ubuntu:22.04
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build git ca-certificates binutils file \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+CMD ["bash", "docker/common/sdk-package.sh"]

@@ -1,0 +1,14 @@
+HyperCat Tool SDK
+Copyright 2026 Savannah Goring
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). It lets you build and distribute third-party tools for HyperCat. HyperCat
+itself — the application and its source — is licensed separately, under its own
+Apache License 2.0, and is NOT covered by this license.
+
+This product includes software developed by third parties:
+
+  - cJSON (https://github.com/DaveGamble/cJSON), MIT License,
+    Copyright (c) 2009-2017 Dave Gamble and cJSON contributors.
+    cJSON is compiled into the prebuilt library lib/libhc_tool_sdk.a.
+    See THIRD_PARTY.txt for its full license text.

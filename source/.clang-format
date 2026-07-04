@@ -1,0 +1,19 @@
+# HyperCat C/C++ style: 4-space indent, function braces on their own line, attached control
+# braces, right-aligned pointers, ~100 col.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Right
+AlignAfterOpenBracket: Align
+SpaceAfterCStyleCast: false
+SortIncludes: false
+IncludeBlocks: Preserve
+KeepEmptyLinesAtTheStartOfBlocks: false

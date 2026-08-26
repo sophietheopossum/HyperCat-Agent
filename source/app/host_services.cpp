@@ -1250,6 +1250,7 @@ Settings from_ui_settings(const hc::ui::UiSettings &u)
     s.egress_allow = u.egress_allow;
     s.exec_allow = u.exec_allow;
     s.auto_approve_contained = u.auto_approve_contained; /* B3 */
+    s.auto_approve_readonly_egress = u.auto_approve_readonly_egress; /* B3b */
     s.allow_all_approvals = u.allow_all_approvals;       /* B4 */
     /* models (W2): the UI catalog -> the settings catalog; the assignment grid (vector of pairs) -> the map. */
     for (const auto &me : u.models) s.models.push_back({me.id, me.note});
@@ -1696,6 +1697,7 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     u.egress_allow = s.egress_allow;
     u.exec_allow = s.exec_allow;
     u.auto_approve_contained = s.auto_approve_contained; /* B3 */
+    u.auto_approve_readonly_egress = s.auto_approve_readonly_egress; /* B3b */
     u.allow_all_approvals = s.allow_all_approvals;       /* B4 */
     /* models (W2): the settings catalog -> the UI catalog; the role->model map -> the assignment grid (pairs). */
     for (const auto &me : s.models) u.models.push_back({me.id, me.note});
@@ -1942,8 +1944,10 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
             /* B3/B4: drive the gate's delegated-approval flags LIVE from the operator's settings (both default OFF). */
             const bool auto_on = svc.settings && svc.settings->settings.auto_approve_contained;
             const bool allow_all_on = svc.settings && svc.settings->settings.allow_all_approvals;
+            const bool ro_egress_on = svc.settings && svc.settings->settings.auto_approve_readonly_egress;
             svc.gate->set_auto_mode(auto_on);
             svc.gate->set_allow_all(allow_all_on);
+            svc.gate->set_readonly_egress_auto(ro_egress_on); /* B3b (the name set rides the poll tick below) */
             /* B3/B4: age the persistent-toast ring + copy the live ones into the snapshot (the approval-pending
              * toasts are appended below from the live pending list). */
             for (auto it = toast_ring.begin(); it != toast_ring.end();) {
@@ -1962,6 +1966,11 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
                                     hc::ui::Toast::Kind::Warning});
             else if (auto_on)
                 s.toasts.push_back({"armed-auto", "auto-approve (sandboxed writes) is ON",
+                                    hc::ui::Toast::Kind::Warning});
+            /* B3b: its own sticky indicator. Independent of auto_on -- either can be armed alone -- and shown
+             * below allow-all, which stays the loud one. No delegated mode is ever silently armed. */
+            if (!allow_all_on && ro_egress_on)
+                s.toasts.push_back({"armed-ro-egress", "auto-approve (read-only web tools) is ON",
                                     hc::ui::Toast::Kind::Warning});
             /* B3: drain the auto-approved trace -> the SAME content-addressed artifact a human approve records
              * (provenance) + a quiet AutoApproved toast. Auto-approval is visible, never silent. */
@@ -2043,6 +2052,16 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
         if (tick % poll_period == 0) {
             if (svc.ws) list_workspace(svc.ws, files_cache, &files_truncated_cache);
             if (!svc.skills_root.empty()) fill_skills(skills_cache, svc.skills_root); /* W6 P6.3 (throttled) */
+            /* B3b: recompute which third-party functions are auto-approvable read-only-egress and hand the gate
+             * the set. Throttled with the other listings -- functions() takes the ToolHost mutex, and the roster
+             * only changes on install/enable/kill-switch. Pushed even when disarmed so arming takes effect on the
+             * next tick rather than needing a tool event. */
+            if (svc.gate && svc.toolhost) {
+                std::unordered_set<std::string> ro_names;
+                for (const auto &f : svc.toolhost->functions())
+                    if (f.readonly_egress) ro_names.insert(f.name);
+                svc.gate->set_readonly_egress_tools(std::move(ro_names));
+            }
             if (svc.audio) scan_audio_library(audio_lib_cache, svc.audio, audio_probe_cache); /* Music Player (throttled) */
             if (svc.store) list_sessions(svc.store, sessions_cache);
             if (svc.conductor_store) list_conductor_conversations(svc.conductor_store, conductor_conv_cache); /* P3b */

@@ -333,6 +333,63 @@ int main()
         gate->set_auto_mode(false);
     }
 
+    /* --- B3b: READ-ONLY EGRESS auto-approve. Fires ONLY for a host-supplied function name, only while armed,
+     *          and leaves everything else to the human. The two negative cases matter more than the positive one:
+     *          an unlisted tool and an armed-but-empty set must both still prompt, because those are the shapes a
+     *          mis-wired host would produce, and a silent widening here would be invisible. --- */
+    {
+        gate->set_readonly_egress_tools({"web_fetch", "web_search"});
+        gate->set_readonly_egress_auto(true);
+
+        CHECK(X->send_request("authgate", 20, authz_body("web_fetch", "fetch https://example.com/")),
+              "worker sends web_fetch while read-only-egress auto is armed");
+        bool approved = false;
+        CHECK(recv_verdict(X, 20, approved) && approved, "read-only-egress APPROVES web_fetch without a prompt");
+        std::vector<PendingAuthView> pend;
+        gate->snapshot(pend);
+        CHECK(pend.empty(), "the auto-approved web_fetch never enters the pending queue");
+        std::vector<hc::host::AutoApprovedView> aa;
+        gate->copy_auto_approved(aa);
+        CHECK(aa.size() == 1 && aa[0].tool == "web_fetch", "the approval is buffered (visible toast, not silent)");
+
+        /* a tool NOT in the host-supplied set still goes to the human, even while armed */
+        CHECK(X->send_request("authgate", 21, authz_body("fs_write", "x.txt")),
+              "worker sends fs_write while read-only-egress auto is armed");
+        std::vector<PendingAuthView> p2;
+        CHECK(wait_count(gate, 1, p2), "an UNLISTED tool still surfaces to the human under read-only-egress auto");
+        if (p2.size() == 1) {
+            gate->resolve(p2[0].id, false);
+            bool a = true;
+            recv_verdict(X, 21, a);
+        }
+
+        /* armed but with an EMPTY set (the mis-wired-host shape) must prompt for everything */
+        gate->set_readonly_egress_tools({});
+        CHECK(X->send_request("authgate", 22, authz_body("web_fetch", "fetch again")),
+              "worker sends web_fetch with an empty eligible set");
+        std::vector<PendingAuthView> p3;
+        CHECK(wait_count(gate, 1, p3), "an EMPTY eligible set disables the path entirely (still prompts)");
+        if (p3.size() == 1) {
+            gate->resolve(p3[0].id, false);
+            bool a = true;
+            recv_verdict(X, 22, a);
+        }
+
+        /* disarmed, with the set repopulated: the name alone must never be sufficient */
+        gate->set_readonly_egress_tools({"web_fetch"});
+        gate->set_readonly_egress_auto(false);
+        CHECK(X->send_request("authgate", 23, authz_body("web_fetch", "fetch disarmed")),
+              "worker sends web_fetch after disarming");
+        std::vector<PendingAuthView> p4;
+        CHECK(wait_count(gate, 1, p4), "DISARMED still prompts even for an eligible name");
+        if (p4.size() == 1) {
+            gate->resolve(p4[0].id, false);
+            bool a = true;
+            recv_verdict(X, 23, a);
+        }
+        gate->set_readonly_egress_tools({});
+    }
+
     /* --- B4: ALLOW-ALL auto-approves EVERYTHING without a prompt — including what auto-mode leaves to the human
      *         (e.g. a shared memory_write) — proving it is the broader, maximal escape hatch --- */
     {

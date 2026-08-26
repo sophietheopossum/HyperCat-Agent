@@ -745,6 +745,9 @@ std::vector<ToolHost::FnView> ToolHost::functions() const
             v.description = kv.second.manifest.description;
             v.spec_json = fn.spec_json;
             v.sensitive = fn.sensitive || kv.second.manifest.envelope_sensitive();
+            /* An individually-flagged function is never demoted to the auto-approvable class: an explicit
+             * `sensitive: true` in the manifest is the author asking for a prompt, and it wins. */
+            v.readonly_egress = !fn.sensitive && kv.second.manifest.envelope_readonly_egress();
             v.running = kv.second.confirmed;
             out.push_back(std::move(v));
         }

@@ -204,6 +204,8 @@ bool settings_parse(const char *json, size_t len, Settings &out)
     /* automation (B3/B4): the delegated-approval opt-ins. Absent => OFF (the human gate is the floor). */
     if (const hc_json *at = hc_json_get(root, "automation")) {
         out.auto_approve_contained = hc_json_get_bool(at, "auto_approve_contained", out.auto_approve_contained);
+        out.auto_approve_readonly_egress =
+            hc_json_get_bool(at, "auto_approve_readonly_egress", out.auto_approve_readonly_egress);
         out.allow_all_approvals = hc_json_get_bool(at, "allow_all_approvals", out.allow_all_approvals);
     }
 
@@ -325,6 +327,7 @@ std::string settings_serialize(const Settings &s)
     }
     if (hc_json *at = hc_json_new_object()) { /* automation (B3/B4): the delegated-approval opt-ins */
         hc_json_obj_set_bool(at, "auto_approve_contained", s.auto_approve_contained);
+        hc_json_obj_set_bool(at, "auto_approve_readonly_egress", s.auto_approve_readonly_egress);
         hc_json_obj_set_bool(at, "allow_all_approvals", s.allow_all_approvals);
         hc_json_obj_set(root, "automation", at);
     }

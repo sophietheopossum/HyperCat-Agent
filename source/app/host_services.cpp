@@ -1834,6 +1834,19 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
      * completion token spent on reasoning and none on output, so this is the lever that attacks the cause
      * rather than the symptom. */
     p.reasoning_effort = std::getenv("HC_REASONING_EFFORT");
+    /* OpenRouter provider routing, verbatim JSON for the `provider` block. Unset = today's
+     * behaviour (OpenRouter picks). This exists because endpoint choice is NOT cosmetic: measured
+     * 27/8/2026, deepseek-v4-flash-0731 completed 3/5 forty-deep tool chains on DeepInfra's fp8 and
+     * 0/5 on OpenInference's fp4 -- five straight transport failures -- and an unpinned slug landed
+     * on a third endpoint again (AkashML). Prefer a QUANTISATION filter over pinning one provider:
+     * `{"quantizations":["fp8","bf16","fp16"]}` excludes 4-bit for every model while keeping
+     * fallbacks, whereas `{"only":["DeepInfra"]}` would break any role whose model it does not host.
+     * Applies to the conductor and planner alike -- the two roles that share this factory. */
+    static std::string provider_body;
+    if (const char *pv = std::getenv("HC_OPENROUTER_PROVIDER"); pv && *pv) {
+        provider_body = std::string("{\"provider\":") + pv + "}";
+        p.extra_body_json = provider_body.c_str();
+    }
     hc_llm *llm = hc_llm_new(&p, http);
     if (!llm) {
         hc_http_free(http);

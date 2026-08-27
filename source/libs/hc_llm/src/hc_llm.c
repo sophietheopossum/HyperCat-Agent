@@ -221,6 +221,7 @@ void hc_llm_free(hc_llm *l)
 {
     if (!l) return;
     secure_zero(l->api_key, sizeof l->api_key); /* scrub the key before releasing the block */
+    free(l->extra_body_json);                   /* owned copy taken in hc_llm_new */
     free(l);
 }
 

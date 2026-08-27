@@ -59,7 +59,8 @@ typedef struct {
      * {"provider":{"only":["DeepInfra"],"allow_fallbacks":false}}, and without it a benchmark
      * comparing quantisations silently measures whichever endpoint the router happened to pick.
      * Must be a JSON OBJECT; its keys are copied onto the request root and override nothing we set.
-     * Borrowed, must outlive the hc_llm. Invalid JSON is dropped with the request built without it. */
+     * COPIED by hc_llm_new, so the caller's buffer need not outlive the client (unlike extra_headers).
+     * Invalid JSON is dropped and the request is built without it -- never failed outright. */
     const char *extra_body_json;
 } hc_llm_provider;
 

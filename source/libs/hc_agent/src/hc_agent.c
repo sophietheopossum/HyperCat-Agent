@@ -50,6 +50,11 @@ struct hc_agent {
     hc_agent_compactor compactor;
     void              *compactor_user; /* borrowed */
     int                compactor_threshold;
+    /* The hc_llm status behind the last HC_AGENT_ERR_LLM. The agent collapses every non-OK transport
+     * result into one error code, which left "model call failed" as the ONLY thing an operator ever saw --
+     * a timeout, an HTTP 429 and a malformed body were indistinguishable. Kept so the caller can say
+     * WHICH. Meaningless unless the run returned HC_AGENT_ERR_LLM. */
+    hc_llm_status last_llm_status;
 };
 
 /* The replacement-history builder a compactor writes into (Conductor P2). Valid only for one compactor
@@ -435,6 +440,11 @@ hc_agent_status hc_agent_run(hc_agent *a, const char *user_message, const hc_age
                              hc_agent_cancel *cancel)
 {
     if (!a || !user_message) return HC_AGENT_ERR_INVALID;
+    /* Forget the previous turn's transport cause up front. The contract says this is only meaningful
+     * after HC_AGENT_ERR_LLM, so a stale value is technically legal -- but a caller reading it after a
+     * DIFFERENT failure would be told a confident, wrong story about a call that never happened. Cheaper
+     * to make a misread harmless than to rely on everyone having read the contract. */
+    a->last_llm_status = HC_LLM_OK;
     if (!hist_push(a, "user", user_message, NULL, NULL)) return HC_AGENT_ERR_NOMEM;
     maybe_compact(a); /* P2: at this turn boundary, compact if over threshold (no-op without a compactor) */
 
@@ -474,6 +484,7 @@ hc_agent_status hc_agent_run(hc_agent *a, const char *user_message, const hc_age
             free(tcs_json);
             free(rc.text);
             free(input_str);
+            a->last_llm_status = lst; /* so the caller can report the CAUSE, not just "it failed" */
             rv = (lst == HC_LLM_ERR_CANCELLED) ? HC_AGENT_ERR_CANCELLED
                  : (lst != HC_LLM_OK)          ? HC_AGENT_ERR_LLM
                                                : HC_AGENT_ERR_NOMEM;
@@ -536,6 +547,8 @@ const char *hc_agent_last_text(const hc_agent *a)
         if (strcmp(a->hist[i - 1].role, "assistant") == 0) return a->hist[i - 1].content;
     return NULL;
 }
+
+hc_llm_status hc_agent_last_llm_status(const hc_agent *a) { return a ? a->last_llm_status : HC_LLM_OK; }
 
 const char *hc_agent_status_str(hc_agent_status s)
 {

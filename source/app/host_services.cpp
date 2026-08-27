@@ -21,6 +21,7 @@
 #include "hc_orchestrator.hpp"
 #include "hc_policy.hpp"  /* WI-2 E2: hc::egress_allow_edit — the host-authoritative allowlist mutation */
 #include "hc_secrets.h"   /* WI-2 E1: the process-local API-key store (the key never reaches a Settings field) */
+#include "host_notify.hpp" /* desktop notifications for pending approvals + their action replies */
 #include "hc_supervisor.hpp"
 #include "hc_fleet.hpp" /* W2 P2.3: the live fleet roster (run_live_loop reads pool() each frame; add/remove) */
 #include "prompt_defang.hpp" /* A: defang an attached file's untrusted basename before it enters the conductor turn */
@@ -226,16 +227,23 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         if (!gate) return "";
         hc::host::AuthResolution r = gate->resolve(c.a, c.n != 0);
         if (r.approved) {
-            if (r.tool == "memory_write" && mbroker)
+            if (r.tool == "memory_write") {
                 /* An approved memory_write means exactly ONE thing — a fleet-shared write — so the host
                  * names the scope itself with a CONSTANT. It must never trust the worker-supplied r.path:
                  * a hostile worker could otherwise craft its own tool.authorize frame with path="agent:B"
                  * and, on one operator click, land a record in another agent's PRIVATE scope (recalled by
                  * B as its own trusted memory). Self writes never reach the gate; only `shared` does. The
                  * reviewed bytes are r.content (bound to the operator's decision in the Approvals panel). */
+                if (!mbroker)
+                    /* No broker (no embedding model, or a model/store clash) means there is nowhere for
+                     * this to land. Say so plainly: falling through to record_write_artifact would file
+                     * an approved MEMORY write as a filesystem artifact — the wrong subsystem entirely —
+                     * and the generic "allowed" below would tell the operator it was saved. */
+                    return "approved, but memory is unavailable — NOT saved (no embedding model)";
                 mbroker->seed("shared", r.content, r.agent /*broker-stamped requester = provenance*/);
-            else
+            } else {
                 record_write_artifact(art, orch, r); /* an approved fs_write -> a content-addressed artifact */
+            }
         }
         return c.n != 0 ? "tool request allowed" : "tool request denied";
     }
@@ -772,8 +780,11 @@ void fill_egress(hc::ui::UiSnapshot &s, hc::host::UiAdapter *adapter)
     for (const auto &e : ev) s.egress.push_back({e.agent, e.host, e.ip, e.verdict, e.port, e.at_ms});
 }
 
-void fill_memory(hc::ui::UiSnapshot &s, hc::host::MemoryBroker *mb)
+void fill_memory(hc::ui::UiSnapshot &s, hc::host::MemoryBroker *mb, const hc::ui::MemoryStatus &status)
 {
+    /* Copied FIRST and unconditionally: the no-broker paths are exactly the ones the panel needs an
+     * explanation for, and returning early without it is what made a refusing store look empty. */
+    s.memory_status = status;
     if (!mb) return;
     std::vector<hc::host::MemRow> rows;
     mb->list(rows);
@@ -1241,6 +1252,8 @@ Settings from_ui_settings(const hc::ui::UiSettings &u)
     s.model = u.model;
     s.base_url = u.base_url;
     s.embed_model = u.embed_model;
+    s.reasoning_effort = u.reasoning_effort;
+    s.notify_approvals = u.notify_approvals;
     s.data_dir = u.data_dir;
     s.ephemeral = u.ephemeral;
     s.llm_call_total_ms = u.llm_call_total_ms;
@@ -1687,6 +1700,9 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     u.model = s.model;
     u.base_url = s.base_url;
     u.embed_model = s.embed_model;
+    u.reasoning_effort = s.reasoning_effort;
+    u.notify_approvals = s.notify_approvals;
+    u.notify_available = hcapp::Notifier::available();
     u.data_dir = s.data_dir;
     u.ephemeral = s.ephemeral;
     u.llm_call_total_ms = s.llm_call_total_ms;
@@ -1714,6 +1730,7 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     u.ov_model = o.model;
     u.ov_base_url = o.base_url;
     u.ov_embed_model = o.embed_model;
+    u.ov_reasoning_effort = o.reasoning_effort;
     u.ov_data_dir = o.data_dir;
     u.ov_ephemeral = o.ephemeral;
     u.ov_llm_call_total_ms = o.llm_call_total_ms;
@@ -1744,6 +1761,7 @@ void inject_settings_env(const Settings &s)
     if (!s.model.empty()) setenv("HC_MODEL", s.model.c_str(), 1);
     if (!s.base_url.empty()) setenv("HC_BASE_URL", s.base_url.c_str(), 1);
     if (!s.embed_model.empty()) setenv("HC_EMBED_MODEL", s.embed_model.c_str(), 1);
+    if (!s.reasoning_effort.empty()) setenv("HC_REASONING_EFFORT", s.reasoning_effort.c_str(), 1);
     setenv("HC_LLM_CALL_TOTAL_MS", std::to_string(s.llm_call_total_ms).c_str(), 1);
     setenv("HC_LLM_CONNECT_MS", std::to_string(s.llm_connect_ms).c_str(), 1);
     setenv("HC_DEEP_REASON_BUDGET", std::to_string(s.deep_reason_budget).c_str(), 1);
@@ -1812,6 +1830,10 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
     p.api_key = key;
     p.model = model;
     p.extra_headers = hdrs;
+    /* Same knob for the conductor + planner. These are the calls that were dying at the 60s cap with every
+     * completion token spent on reasoning and none on output, so this is the lever that attacks the cause
+     * rather than the symptom. */
+    p.reasoning_effort = std::getenv("HC_REASONING_EFFORT");
     hc_llm *llm = hc_llm_new(&p, http);
     if (!llm) {
         hc_http_free(http);
@@ -1907,6 +1929,12 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
     std::vector<std::pair<hc::ui::Toast, int>> toast_ring;
     TimelineLog                      timeline;       /* activity-span accumulator (P10)            */
     std::unordered_map<std::string, hc::ui::PendingDiff> diff_cache; /* fs_write diffs, computed once (P11) */
+    /* An approval nobody sees is a worker blocked until it times out, and the Approvals panel is only
+     * visible when this window is focused. Null whenever notifications are unavailable, which every use
+     * below tolerates. `notified` is the set already posted, so a request is announced ONCE, not per frame. */
+    std::unique_ptr<hcapp::Notifier> notifier(
+        (svc.settings && svc.settings->settings.notify_approvals) ? hcapp::Notifier::start() : nullptr);
+    std::unordered_set<std::string>  notified;
     int                              tick = 0;
     ChatAttachState                  chat_attach; /* A: conductor chat attachments (staged queue + sent-image history) */
     for (;;) {
@@ -1920,7 +1948,7 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
             fill_usage(s, svc.adapter); /* P12: per-agent token totals (shared with the capture path) */
             fill_egress(s, svc.adapter); /* P08.2: recent egress decisions for the Network panel */
         }
-        fill_memory(s, svc.mbroker);  /* P01: the Memory panel rows (no-op offline) */
+        fill_memory(s, svc.mbroker, svc.mem_status);  /* P01: the Memory panel rows + why they are absent */
         fill_conductor(s, svc.conductor, chat_attach); /* Conductor P5 + A: chat conversation/goals/staged attachments */
         fill_projects(s, svc.projects); /* W3 P3.2: the Projects panel list + active project */
         s.skills = skills_cache; /* W6 P6.3: the per-project Skills panel list (throttled cache, below) */
@@ -1999,6 +2027,14 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
                     if (svc.gate->peek_content(p.id, scope, content))
                         summary = "save to SHARED memory:\n" + content;
                 }
+                if (notified.insert(p.id).second) { /* first sighting only */
+                    if (notifier) {
+                        notifier->send(p.id, p.agent, p.tool, summary);
+                        /* Part of the same opt-in: flagging the window is equally a reach for the
+                         * operator's attention, so it follows the setting rather than being always-on. */
+                        ui.request_attention();
+                    }
+                }
                 s.pending_auth.push_back({p.id, p.agent, p.tool, std::move(summary), p.age_ms});
                 /* B2: a clickable toast per pending request — keyed to the id, so it appears with the prompt and
                  * self-clears when the request is resolved/dismissed (the snapshot is rebuilt each frame). Makes a
@@ -2030,6 +2066,13 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
             }
             for (auto it = diff_cache.begin(); it != diff_cache.end();) /* drop resolved prompts */
                 it = live.count(it->first) ? std::next(it) : diff_cache.erase(it);
+            /* Withdraw a popup whose request is gone -- answered in-app, dismissed, or the worker gave up.
+             * Leaving it on screen would offer a verdict on something already decided. */
+            for (auto it = notified.begin(); it != notified.end();) {
+                if (live.count(*it)) { ++it; continue; }
+                if (notifier) notifier->close(*it);
+                it = notified.erase(it);
+            }
             for (const auto &p : pend) /* surface the diffs in prompt order */
                 if (diff_cache.count(p.id)) s.pending_diff.push_back(diff_cache[p.id]);
         }
@@ -2114,6 +2157,17 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
         }
         ui.set_snapshot(std::move(s)); /* MOVE: s is a fresh per-frame build, unused after this */
         std::vector<hc::ui::UiCommand> cmds = ui.drain_commands();
+        /* Verdicts given from a notification button are turned into ordinary ToolVerdict commands and
+         * prepended to this frame's queue, so they travel the EXACT path a click through the Approvals
+         * panel travels -- the scoped-capability minting, the artifact provenance, the shared-memory
+         * seeding. Duplicating any of that here would be a second implementation to keep in step. */
+        if (notifier) {
+            std::vector<std::pair<std::string, bool>> verdicts;
+            notifier->drain(verdicts);
+            for (const auto &v : verdicts)
+                cmds.insert(cmds.begin(),
+                            {hc::ui::UiCommand::Kind::ToolVerdict, v.first, "", v.second ? 1 : 0, {}, {}});
+        }
         /* A.4: files the operator DRAGGED onto the window this frame — staged via the hardened non-jailed os-file
          * read (operator-initiated; O_NOFOLLOW + regular-file + capped). They ride the SAME staging/send path. */
         for (const std::string &drop : ui.drain_dropped_paths())

@@ -514,7 +514,7 @@ int main(int argc, char **argv)
                 if (svc.store) list_sessions(svc.store, s.sessions);
                 if (svc.artifacts) list_artifacts(svc.artifacts, s.artifacts);
                 fill_usage(s, svc.adapter);  /* P12: token usage from the workers' turn.usage pubs */
-                fill_memory(s, svc.mbroker); /* P01: the Memory panel rows */
+                fill_memory(s, svc.mbroker, svc.mem_status); /* P01: the Memory panel rows + why they are absent */
                 fill_projects(s, svc.projects); /* W3 P3.2: the Projects panel list */
                 fill_skills(s.skills, svc.skills_root); /* W6 P6.3: the Skills panel list (capture path) */
                 static std::map<std::string, hc::ui::AudioTrack> audio_cap_cache; /* probe-once across frames */
@@ -532,7 +532,7 @@ int main(int argc, char **argv)
                 hc::ui::UiSnapshot s = build_snapshot(*orch_, *sup, fleet_mgr->pool(), &role_state.table); /* refresh so the panel shows them */
                 s.provider = info.live ? "openrouter" : "offline";
                 s.model = info.live ? info.model : "";
-                fill_memory(s, svc.mbroker);
+                fill_memory(s, svc.mbroker, svc.mem_status);
                 cap->set_snapshot(std::move(s));
                 cap->render_frames(1);
             }

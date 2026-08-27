@@ -94,6 +94,10 @@ hc_agent *hc_agent_new_backend(const hc_agent_backend *backend, const char *syst
  * outlive any agent built from the returned backend. */
 hc_agent_backend hc_agent_hosted_backend(hc_llm *llm);
 void      hc_agent_free(hc_agent *);
+/* The hc_llm status underlying the last HC_AGENT_ERR_LLM from this agent -- a timeout, an HTTP error, a
+ * non-2xx status and an unparseable body all surface as that ONE code, so this is the only way to tell
+ * an operator which of them happened. Only meaningful after a run returned HC_AGENT_ERR_LLM. */
+hc_llm_status hc_agent_last_llm_status(const hc_agent *);
 
 /* Register a tool. The hc_agent_tool struct is COPIED; the pointers it holds (name, spec_json, and
  * user) are BORROWED and must stay valid until hc_agent_free — so passing a local struct is fine, but

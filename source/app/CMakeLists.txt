@@ -16,14 +16,27 @@ endforeach()
 # wiring + the render loop; spawns agentd at runtime (AGENTD_PATH = the just-built worker).
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
   find_package(Threads REQUIRED)
+  # host_notify needs GIO for GDBus (desktop notifications + their action replies). glib2 is already a
+  # runtime dependency via libsecret, so this adds no new package -- only a link. FIND-OR-SKIP, like the
+  # keychain: without it the notifier compiles to nothing and approvals behave exactly as before.
+  pkg_check_modules(GIO gio-2.0)
   add_executable(hypercat main.cpp host_services.cpp host_conductor.cpp project_session.cpp text_diff.cpp
-                 skill_store.cpp exe_path.cpp)
+                 skill_store.cpp exe_path.cpp host_notify.cpp)
   target_link_libraries(hypercat
     PRIVATE hc::ui hc::orchestrator hc::supervisor hc::bus hc::json hc::fs hc::host_bridge hc::sandbox
             hc::store hc::artifacts hc::memory hc::pty hc::consolidation hc::host_storage hc::planner
             hc::conductor hc::reasoning hc::sysstat hc::settings hc::roles hc::secrets hc::policy hc::fleet
             hc::projects hc::prompt_defang hc::conductor_prompt hc::audio hc::toolhost Threads::Threads
             hc_warnings hc_sanitizers)
+  if(GIO_FOUND)
+    target_compile_definitions(hypercat PRIVATE HC_WITH_NOTIFY)
+    target_include_directories(hypercat SYSTEM PRIVATE ${GIO_INCLUDE_DIRS})
+    target_link_directories(hypercat PRIVATE ${GIO_LIBRARY_DIRS})
+    target_link_libraries(hypercat PRIVATE ${GIO_LIBRARIES})
+    message(STATUS "HyperCat: desktop notifications ON (gio ${GIO_VERSION})")
+  else()
+    message(STATUS "HyperCat: gio-2.0 not found -- approval notifications disabled")
+  endif()
   add_dependencies(hypercat agentd hc_audio_helper hc_tool_launch)
   target_compile_definitions(hypercat PRIVATE AGENTD_PATH="$<TARGET_FILE:agentd>")
   # W-Audio.1: the confined audio probe helper — host_services spawns it per library file so the untrusted audio

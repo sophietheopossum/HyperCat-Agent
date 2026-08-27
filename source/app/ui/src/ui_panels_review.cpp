@@ -43,7 +43,34 @@ void draw_pending_diff(const PendingDiff &d)
 void draw_memory_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
 {
     if (ImGui::Begin("Memory", open)) {
-        if (s.memory.empty()) {
+        const MemoryStatus &st = s.memory_status;
+        using MState = MemoryStatus::State;
+        if (st.state == MState::ModelClash) {
+            /* The dangerous state, and the reason this branch exists at all: the store HOLDS records
+             * but will not serve them, because scoring them against another model's vectors returns
+             * confident nonsense. Falling through to "no memories yet" would describe a refusing store
+             * as an empty one — reassuring, and wrong. All ids are format ARGUMENTS, never the format. */
+            ImGui::TextColored(err_v4(), "memory unavailable — the store is refusing");
+            ImGui::Spacing();
+            WrappedText("These records were embedded by %s%s, but the model configured now is %s. "
+                        "Vectors from two different models are not comparable, so recall and writes are "
+                        "refused rather than answered with nonsense.",
+                        st.store_model.empty() ? "(unknown)" : st.store_model.c_str(),
+                        st.store_model_assumed ? " (assumed — inferred later, not recorded at the time)" : "",
+                        st.config_model.empty() ? "(none)" : st.config_model.c_str());
+            ImGui::Spacing();
+            WrappedText("Set the embedding model back to %s in Settings > Provider, or delete %s to start "
+                        "a fresh store on the new model.",
+                        st.store_model.empty() ? "the original one" : st.store_model.c_str(),
+                        st.store_path.empty() ? "this project's memory directory" : st.store_path.c_str());
+        } else if (st.state == MState::NoEmbedModel) {
+            ImGui::TextColored(muted_v4(), "memory is off — no embedding model configured");
+            ImGui::Spacing();
+            WrappedText("Storing a memory and recalling one both need an embedding model: the text is "
+                        "turned into a vector so it can be found by meaning later. Without one there is "
+                        "nowhere for a memory to go, so writes are refused as well as recall — not just "
+                        "the search. Set one in Settings > Provider.");
+        } else if (s.memory.empty()) {
             ImGui::TextColored(muted_v4(), "no memories yet — the fleet learns as it works");
         } else {
             ImGui::TextColored(muted_v4(), "%zu memories (reference, not instruction)", s.memory.size());

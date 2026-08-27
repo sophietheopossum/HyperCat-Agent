@@ -26,6 +26,7 @@ struct hc_llm {
     char probe_host[128];
     char probe_port[16];
     const char *const *extra_headers; /* borrowed */
+    char reasoning_effort[16];        /* "" = omit the field */
     hc_llm_usage last_usage;          /* the most recent call's token/cost usage (P12)      */
     hc_llm_usage total_usage;         /* running total of reported usage across all calls    */
 };
@@ -54,13 +55,39 @@ static hc_json *build_message(const hc_llm_message *msg)
     return m;
 }
 
+/* The accepted ladder, verified against a live OpenRouter endpoint rather than assumed: "low"/"medium"/
+ * "high" is the familiar OpenAI trio, but "minimal", "xhigh" and "max" are accepted too
+ *
+ * An unrecognised value is dropped rather than forwarded: a provider that rejects an unknown enum fails
+ * the whole request, and quietly using the default beats every call 400ing on a typo in a settings box.
+ * The trade is that a genuinely new level lands here as a silent default until this list is updated. */
+static int effort_is_valid(const char *e)
+{
+    static const char *const kLevels[] = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+    if (!e) return 0;
+    for (size_t i = 0; i < sizeof kLevels / sizeof kLevels[0]; i++)
+        if (strcmp(e, kLevels[i]) == 0) return 1;
+    return 0;
+}
+
 char *hc_llm_build_request_json(const char *model, const hc_llm_message *msgs, size_t n_msgs,
                                 const char *tools_json, bool stream)
+{
+    return hc_llm_build_request_json_ex(model, msgs, n_msgs, tools_json, stream, NULL);
+}
+
+char *hc_llm_build_request_json_ex(const char *model, const hc_llm_message *msgs, size_t n_msgs,
+                                   const char *tools_json, bool stream, const char *reasoning_effort)
 {
     hc_json *root = hc_json_new_object();
     if (!root) return NULL;
     if (!hc_json_obj_set_str(root, "model", model ? model : "")
         || !hc_json_obj_set_bool(root, "stream", stream)) {
+        hc_json_free(root);
+        return NULL;
+    }
+    if (effort_is_valid(reasoning_effort)
+        && !hc_json_obj_set_str(root, "reasoning_effort", reasoning_effort)) {
         hc_json_free(root);
         return NULL;
     }
@@ -130,6 +157,8 @@ hc_llm *hc_llm_new(const hc_llm_provider *cfg, hc_http *http)
     snprintf(l->model, sizeof l->model, "%s", cfg->model ? cfg->model : "");
     snprintf(l->probe_host, sizeof l->probe_host, "%s", cfg->probe_host ? cfg->probe_host : "");
     snprintf(l->probe_port, sizeof l->probe_port, "%s", cfg->probe_port ? cfg->probe_port : "443");
+    snprintf(l->reasoning_effort, sizeof l->reasoning_effort, "%s",
+             cfg->reasoning_effort ? cfg->reasoning_effort : "");
     l->extra_headers = cfg->extra_headers;
     l->last_usage.input_tokens = l->last_usage.output_tokens = l->last_usage.total_tokens = -1;
     return l;
@@ -172,7 +201,8 @@ hc_llm_status hc_llm_chat_stream(hc_llm *l, const hc_llm_message *msgs, size_t n
 {
     if (!l || !msgs) return HC_LLM_ERR_INVALID;
 
-    char *body = hc_llm_build_request_json(l->model, msgs, n_msgs, tools_json, true);
+    char *body = hc_llm_build_request_json_ex(l->model, msgs, n_msgs, tools_json, true,
+                                              l->reasoning_effort[0] ? l->reasoning_effort : NULL);
     if (!body) return HC_LLM_ERR_PARSE;
 
     char auth[300];

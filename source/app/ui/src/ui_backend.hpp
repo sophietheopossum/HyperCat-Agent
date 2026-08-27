@@ -33,6 +33,11 @@ public:
      * iteration; works on a HIDDEN window because GL renders regardless of visibility). */
     void end_frame(const char *capture_ppm_path = nullptr);
 
+    /* Ask the compositor to mark this window as wanting attention (a flashing taskbar entry, an urgency
+     * hint -- the compositor decides how). The one thing a Wayland client MAY do about its own window:
+     * positioning and raising are both refused by the protocol, this is not. No-op where unsupported. */
+    void request_attention();
+
     /* A.4: absolute OS file paths the operator DRAGGED onto the window since the last call (the GLFW drop
      * callback), moved out + the queue cleared. UNTRUSTED, NON-JAILED paths — the host reads them through its
      * hardened, operator-gated os-file path, NOT the sandbox. Empty on a headless / no-window backend. */

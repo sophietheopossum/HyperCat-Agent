@@ -52,6 +52,7 @@ typedef struct {
     const char *probe_host;        /* host for hc_llm_probe, or NULL                    */
     const char *probe_port;        /* port for hc_llm_probe, or NULL (defaults "443")   */
     const char *const *extra_headers; /* NULL-terminated; borrowed, must outlive hc_llm */
+    const char *reasoning_effort;     /* one of the levels in hc_llm.c; NULL/"" = omit (the default)     */
 } hc_llm_provider;
 
 typedef struct {
@@ -76,6 +77,21 @@ typedef struct {
  * malloc'd JSON string the caller frees, or NULL on OOM / invalid tools_json. */
 char *hc_llm_build_request_json(const char *model, const hc_llm_message *msgs, size_t n_msgs,
                                 const char *tools_json, bool stream);
+
+/* As above, plus `reasoning_effort`: the OpenAI-compatible knob for how long a REASONING model thinks
+ * before it answers. Accepted are "none", "minimal", "low", "medium", "high", "xhigh" and "max" -- the
+ * familiar OpenAI trio plus the levels a live OpenRouter endpoint was observed to take. Anything else,
+ * including NULL and "", omits the field entirely, which is what every non-reasoning provider wants and
+ * is the default. Keep this list and effort_is_valid() in hc_llm.c in step; the single source of truth
+ * is that function.
+ *
+ * This exists because reasoning time is a real failure mode, not a tuning nicety. A reasoning model on a
+ * ~22k-token prompt was observed spending SIXTY SECONDS emitting nothing but reasoning tokens -- every one
+ * of its completion tokens, none of them output -- and being cancelled by the client's wall-clock cap
+ * before it began to answer. Raising the cap only defers that as context grows; capping the thinking
+ * addresses it. Providers that do not support the field ignore it. */
+char *hc_llm_build_request_json_ex(const char *model, const hc_llm_message *msgs, size_t n_msgs,
+                                   const char *tools_json, bool stream, const char *reasoning_effort);
 
 typedef struct hc_llm hc_llm;
 

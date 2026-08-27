@@ -313,9 +313,19 @@ std::string run_agent_task(const TaskCtx &tc, const std::string &title, const st
     if (tc.llm) hc_llm_total_usage(tc.llm, &u0); /* P12: token total before this turn */
     hc_agent_status st = hc_agent_run(ag, prompt.c_str(), &obs, nullptr);
     const char       *txt = hc_agent_last_text(ag);
-    std::string       result = (st == HC_AGENT_OK && txt && *txt)
-                                   ? std::string(txt)
-                                   : (std::string("error: ") + hc_agent_status_str(st));
+    /* Name the CAUSE. "model call failed" alone cannot distinguish a timeout from an HTTP 429 from an
+     * unparseable body, and that string was the only thing reaching the operator -- who then has nothing
+     * to act on. The underlying transport status is appended whenever there is one. */
+    std::string result;
+    if (st == HC_AGENT_OK && txt && *txt) {
+        result = txt;
+    } else {
+        result = std::string("error: ") + hc_agent_status_str(st);
+        if (st == HC_AGENT_ERR_LLM) {
+            const hc_llm_status ls = hc_agent_last_llm_status(ag);
+            result += std::string(" (") + hc_llm_status_str(ls) + ")";
+        }
+    }
     hc_agent_free(ag);
     /* Defense in depth: hc_agent already caps retained text, but guarantee LOCALLY that what we put
      * on the bus always fits a frame — the worker owns this invariant regardless of the agent impl. */
@@ -447,6 +457,9 @@ constexpr int kLlmConnectMs = 10000;    /* TCP/TLS connect timeout for an LLM ca
     pcfg.api_key = key;
     pcfg.model = cfg.model.c_str();
     pcfg.extra_headers = hdrs;
+    /* Cap how long a reasoning model thinks. Unset = the model's own default, which on a large prompt can
+     * consume the entire wall-clock budget in reasoning tokens and be cancelled before it answers. */
+    pcfg.reasoning_effort = std::getenv("HC_REASONING_EFFORT");
     *http = h;
     return hc_llm_new(&pcfg, h);
 }

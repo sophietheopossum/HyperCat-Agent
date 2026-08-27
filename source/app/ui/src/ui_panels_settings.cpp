@@ -216,6 +216,11 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
     settings_text_row("model", d.model, live.ov_model);
     settings_text_row("base url", d.base_url, live.ov_base_url);
     settings_text_row("embed model", d.embed_model, live.ov_embed_model);
+    /* Blank -- the default -- omits the field, leaving the request exactly as it was before this setting
+     * existed. An unrecognised value is dropped at the request builder rather than forwarded, so a typo
+     * costs the provider default rather than a 400 on every call. */
+    settings_text_row("reasoning effort", d.reasoning_effort, live.ov_reasoning_effort);
+    ImGui::TextColored(muted_v4(), "blank = provider default; none/minimal/low/medium/high/xhigh/max");
 
     ImGui::Spacing();
     PanelHeader("API KEY");
@@ -243,6 +248,22 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
     /* SECURITY (default-OFF): re-expose the key to worker process environments (/proc/<pid>/environ,
      * same-uid). OFF keeps it host-only. Persisted with the settings; takes effect on the next spawn. */
     ImGui::Checkbox("export key to worker env (re-exposes it; default off)", &d.export_key_to_env);
+    /* Off by default: this reaches outside the app onto the operator's desktop. On, a pending approval
+     * appears as a notification with Approve/Deny and the window asks for attention.
+     *
+     * The note is not decoration. The notification BODY is the request summary -- for a memory_write
+     * that is the memory payload itself, for an fs_write the path and content -- and it leaves HyperCat
+     * for a notification daemon that typically keeps a history and journals what it shows. An operator
+     * turning this on is consenting to that, so it has to be stated where the choice is made. */
+    const bool notify_ok = live.notify_available;
+    ImGui::BeginDisabled(!notify_ok);
+    ImGui::Checkbox("desktop notification for approvals (default off)", &d.notify_approvals);
+    ImGui::EndDisabled();
+    if (notify_ok)
+        ImGui::TextColored(muted_v4(), "applies on restart — sends the request summary to your desktop "
+                                       "notification service, which may keep a history");
+    else
+        ImGui::TextColored(muted_v4(), "unavailable in this build (needs gio-2.0 / a D-Bus session)");
 
     ImGui::Spacing();
     PanelHeader("LIMITS");

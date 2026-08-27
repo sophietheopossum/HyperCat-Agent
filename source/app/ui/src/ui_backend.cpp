@@ -140,6 +140,11 @@ void Backend::end_frame(const char *capture_ppm_path)
     glfwSwapBuffers(p_->win);
 }
 
+void Backend::request_attention()
+{
+    if (p_->win) glfwRequestWindowAttention(p_->win);
+}
+
 std::vector<std::string> Backend::drain_dropped_paths()
 {
     std::vector<std::string> out = std::move(p_->dropped_);

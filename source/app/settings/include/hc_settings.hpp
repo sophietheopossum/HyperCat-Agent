@@ -48,6 +48,20 @@ struct Settings {
     std::string model;       /* chat model (empty = offline echo)        */
     std::string base_url;    /* empty = the OpenRouter default           */
     std::string embed_model; /* embeddings model (empty = no embeddings) */
+    /* Bounds how long a REASONING model thinks, as the OpenAI-compatible `reasoning_effort` request
+     * field. Measured on one model with one prompt, "max" produced roughly 4x the tokens of "low", so
+     * this is really a wall-clock dial -- and on a rate-limited or free model wall-clock is the only
+     * budget that binds. Accepted values are listed in hc_llm.h; an unrecognised one is DROPPED at the
+     * request builder rather than forwarded, so a typo costs the provider default, not a 400 on every
+     * call.
+     *
+     * DEFAULT EMPTY = omit the field entirely, which is byte-identical to the behaviour before this
+     * setting existed. Deliberate: a non-empty default would change the request body for every existing
+     * install. OpenRouter and OpenAI ignore a field their model has no notion of, but that is not a
+     * property of "OpenAI-compatible" in general -- stricter servers reject unknown or unsupported
+     * parameters outright, and "Local LLM = Both" is a locked decision, so the local llama.cpp/vLLM path
+     * has to keep working untouched. The operator opts in; nobody is opted in for. */
+    std::string reasoning_effort;
 
     /* paths */
     std::string data_dir;        /* empty = the XDG/default resolution    */
@@ -71,6 +85,11 @@ struct Settings {
      * consent window and loud while live (B4). Neither is ever injected into a worker's env. */
     bool auto_approve_contained = false;
     bool allow_all_approvals = false;
+    /* Post a pending approval as a DESKTOP notification (with Approve/Deny actions), and mark the window
+     * as wanting attention. DEFAULT OFF: it reaches outside the application to the user's desktop, which
+     * is not a decision this program should make on an operator's behalf. When off, nothing connects to
+     * the session bus at all. Applies at launch. */
+    bool notify_approvals = false;
 
     /* models (Worker Revamp W2) — EXTENDS the single `model` above (which stays the global/fallback). With
      * both empty, behaviour is byte-identical to today. */
@@ -110,7 +129,8 @@ struct Settings {
  * The UI renders an overridden field disabled with an "overridden by $VAR" note; the host must not persist
  * an env-derived value back as if the operator chose it. */
 struct EnvOverrides {
-    bool model = false, base_url = false, embed_model = false, data_dir = false, ephemeral = false;
+    bool model = false, base_url = false, embed_model = false, reasoning_effort = false, data_dir = false,
+         ephemeral = false;
     bool llm_call_total_ms = false, llm_connect_ms = false, deep_reason_budget = false,
          task_deadline_ms = false, egress_allow = false;
 };

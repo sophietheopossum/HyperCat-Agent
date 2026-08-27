@@ -162,6 +162,15 @@ void ConductorChatView::draw_scrollback(const UiSnapshot &s, const SpriteRegistr
             ImGui::PushID(idx++);
             ImGui::BeginGroup();
             const bool assistant = (m.role == "assistant");
+            /* Selection and formatting are mutually exclusive in ImGui: the only widget with real
+             * drag-selection is a read-only InputTextMultiline, which can render nothing but flat text.
+             * So an assistant turn stays FORMATTED by default and offers a per-message switch to raw,
+             * selectable text -- rather than flattening everyone's markdown for the occasional lift of
+             * a fragment. Operator turns are already plain, so they are selectable unconditionally.
+             * State lives in ImGui's per-ID storage, so it is remembered per message and costs nothing. */
+            ImGuiStorage *st = ImGui::GetStateStorage();
+            const ImGuiID sel_key = ImGui::GetID("##selraw");
+            const bool    raw = st->GetBool(sel_key, false);
             ImGui::TextColored(assistant ? accent_v4() : muted_v4(), "%s", assistant ? "HyperCat" : "you");
             if (m.at_ms != 0) { /* D: a muted local HH:MM beside the name (0 = a resumed turn with no stored time) */
                 const std::time_t t = (std::time_t)(m.at_ms / 1000u);
@@ -173,10 +182,17 @@ void ConductorChatView::draw_scrollback(const UiSnapshot &s, const SpriteRegistr
                     ImGui::TextColored(muted_v4(), "%s", ts);
                 }
             }
-            if (assistant)
+            if (assistant) { /* the switch sits on the header row, beside the name + time */
+                ImGui::SameLine();
+                if (ImGui::SmallButton(raw ? "formatted" : "select")) st->SetBool(sel_key, !raw);
+            }
+            /* Whatever the reader has HIGHLIGHTED in this message, remembered across the right-click that
+             * would otherwise destroy it. Empty for a formatted turn, which has no selectable widget. */
+            std::string picked;
+            if (assistant && !raw)
                 render_markdown_cached(m.text); /* the FINISHED assistant turn, formatted */
             else
-                WrappedText("%s", m.text.c_str()); /* untrusted operator text, verbatim */
+                picked = selectable_text("##msgtext", m.text); /* untrusted text, verbatim + selectable */
             /* A: operator-attached images, shown inline (the text-only conductor never sees them). The per-frame
              * byte budget keeps this panel's DRAWN set within the dedicated chat cache, so a later get() only ever
              * evicts a PRIOR-frame texture — never one already in this frame's draw list. */
@@ -202,7 +218,10 @@ void ConductorChatView::draw_scrollback(const UiSnapshot &s, const SpriteRegistr
                 ImGui::TextColored(muted_v4(), "%s", att.name.c_str());
             }
             ImGui::EndGroup();
-            copy_block_menu("chat_msg", m.text, all); /* right-click a turn -> Copy / Copy all */
+            /* Copy the SELECTION when there is one -- copying the whole message out from under a
+             * deliberate highlight is a silent wrong answer. The label says which you are getting. */
+            copy_block_menu("chat_msg", picked.empty() ? m.text : picked, all,
+                            picked.empty() ? "Copy" : "Copy selection");
             ImGui::PopID();
             ImGui::Spacing();
         }

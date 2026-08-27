@@ -22,7 +22,8 @@ namespace hc::ui {
  * must be unique within the live ID stack (PushID a per-message index around repeated blocks). Renders
  * nothing until right-clicked; the hover/click test uses the last item's rect, so call it immediately after
  * the block (after EndGroup for a multi-widget message). */
-void copy_block_menu(const char *id, const std::string &block, const std::string &all);
+void copy_block_menu(const char *id, const std::string &block, const std::string &all,
+                     const char *block_label = "Copy");
 
 /* A window/child-level right-click "Copy all" menu for `all` (the whole panel's text). `only_empty_space`
  * true => opens ONLY over non-item space, so it composes with per-block menus on a discrete-message panel
@@ -37,6 +38,34 @@ void copy_region_menu(const char *id, const std::string &all, bool only_empty_sp
  * caller positions it); `id` must be unique in the live ID stack (the markdown renderer PushID's the block index).
  * `text` travels as literal clipboard bytes (never a format string). Returns true on the click. */
 bool copy_button(const char *id, const std::string &text);
+
+/* Render `text` as SELECTABLE, read-only text: drag to select a fragment, Ctrl+A / Ctrl+C as usual. The
+ * right-click menus above lift a WHOLE block; this is for lifting part of one.
+ *
+ * ImGui has no selectable label -- TextUnformatted and the markdown renderer are inert -- so the only
+ * widget with real selection is a read-only InputTextMultiline, styled here to be indistinguishable from
+ * ordinary text (no frame, no border, no padding). That is safe against the caller's buffer: in read-only
+ * mode ImGui reads `buf` directly and every mutating path (insert, cut, paste, undo) is gated on
+ * !is_readonly, so `text` is never written to (imgui_widgets.cpp, InputTextEx).
+ *
+ * The box is sized to the WRAPPED height plus a small margin, deliberately: a child window with nothing to
+ * scroll bubbles the mouse wheel up to its parent (FindBestWheelingWindow tests ScrollMax != 0), so an
+ * exactly-or-generously sized box leaves the enclosing panel scrolling normally. Undersize it and the wheel
+ * is captured and the chat stops scrolling under the cursor.
+ *
+ * `id` must be unique in the live ID stack and should start with "##" (the label is not drawn).
+ *
+ * RETURNS the currently selected substring, or "" when nothing is selected. The selection is remembered
+ * across frames on purpose: a right-click DEACTIVATES the input and destroys the live selection before any
+ * context menu can read it, so asking ImGui at menu time always finds nothing. Exactly ONE selection is
+ * remembered process-wide -- ImGui has one active input at a time, so one is all that can exist -- and it
+ * belongs to whichever call selected last. Every other caller gets "", which is what makes their menus
+ * offer the whole block instead of some stale fragment from a message the reader has moved on from.
+ *
+ * A call whose rect is fully scrolled out of view draws a same-height spacer instead of the widget and
+ * returns "": the panel has no list clipper, and a child window per off-screen block per frame is real
+ * cost for text nobody can see or click. Scrolling it back restores the widget in the same frame. */
+std::string selectable_text(const char *id, const std::string &text);
 
 } // namespace hc::ui
 

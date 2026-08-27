@@ -227,10 +227,53 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
     }
 
     /* P01 memory: the per-project semantic store + the recall broker (when an embeddings model is configured). */
-    s->svc_.memory = hc_memory_open(s->roots_.memory.c_str());
     const char *embed_model = getenv("HC_EMBED_MODEL");
     const char *or_key = getenv("OPENROUTER_API_KEY");
-    if (s->svc_.memory && embed_model && *embed_model && or_key && *or_key) {
+    /* Bind the store to the embedding model that produced its vectors. A swap to a DIFFERENT model of
+     * the same dimension passes every length check and silently returns nonsense from recall, so it is
+     * reported loudly here rather than absorbed. */
+    /* An id the store cannot record leaves the binding unenforced. That is survivable, but it must not
+     * be silent: the whole point of the field is that an undetected model swap is the expensive one. */
+    bool embed_model_printable = true; /* reused below: an id we refuse to BIND we also refuse to ECHO */
+    if (embed_model && *embed_model) {
+        size_t idn = 0;
+        bool   ok = true;
+        for (; embed_model[idn]; idn++)
+            if ((unsigned char)embed_model[idn] < 0x20 || (unsigned char)embed_model[idn] > 0x7e) ok = false;
+        embed_model_printable = ok;
+        if (!ok || idn >= (size_t)HC_MEM_MODEL_MAX)
+            std::fprintf(stderr,
+                         "host: *** HC_EMBED_MODEL is not a bindable id (%zu bytes; must be printable "
+                         "ASCII under %d). The store cannot record which model produced its vectors, so "
+                         "a later model swap will NOT be detected. ***\n",
+                         idn, HC_MEM_MODEL_MAX);
+    }
+    s->svc_.memory = hc_memory_open_model(s->roots_.memory.c_str(), embed_model);
+    const bool mem_model_clash = s->svc_.memory && hc_memory_model_mismatch(s->svc_.memory);
+    if (mem_model_clash) {
+        /* An ADOPTED id was inferred from a store that predates the recording, not witnessed — say so,
+         * rather than asserting a provenance this process cannot actually vouch for. */
+        const char *had = hc_memory_model(s->svc_.memory);
+        const bool  assumed = hc_memory_model_adopted(s->svc_.memory) != 0;
+        std::fprintf(stderr,
+                     "host: *** MEMORY DISABLED — this store's vectors are %s embedding model '%s', but "
+                     "HC_EMBED_MODEL is '%s'. Two models' vectors are not comparable, so recall and "
+                     "writes are refused rather than served as nonsense. Set HC_EMBED_MODEL back to "
+                     "'%s', or delete %s to start a fresh store on the new model. ***\n",
+                     assumed ? "ASSUMED (inferred, not recorded at the time) to come from"
+                             : "recorded as coming from",
+                     had,
+                     /* The store side already refuses to echo a non-printable id, because this line goes
+                      * to a terminal and control bytes there can forge log lines or inject ANSI into the
+                      * very message the operator has to act on. The CONFIGURED id arrives from the
+                      * environment and deserves the same treatment -- an operator env var is not a
+                      * trusted string just because it is not the attacker's first choice of vector. */
+                     !embed_model          ? "(unset)"
+                     : embed_model_printable ? embed_model
+                                             : "(unprintable)",
+                     had, s->roots_.memory.c_str());
+    }
+    if (s->svc_.memory && !mem_model_clash && embed_model && *embed_model && or_key && *or_key) {
         const char                     *base = getenv("HC_BASE_URL");
         std::unordered_set<std::string> fleet; /* the LIVE roster (empty now; refreshed on add/remove) */
         s->svc_.mbroker = hc::host::MemoryBroker::start(sock, fleet, s->svc_.memory,
@@ -240,6 +283,22 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
             if (const char *seedf = getenv("HC_MEMORY_SEED")) seed_memory_from_file(s->svc_.mbroker, seedf);
             std::fprintf(stderr, "host: memory recall ONLINE (embed model %s)\n", embed_model);
         }
+    }
+
+    /* Record WHY memory is in whatever state it is, while the store handle, the configured id and the
+     * store path are all still in scope. The stderr lines above are invisible to anyone running the
+     * app normally; this is the same information for the Memory panel. */
+    {
+        hc::ui::MemoryStatus &ms = s->svc_.mem_status;
+        ms.config_model = embed_model ? embed_model : "";
+        ms.store_path = s->roots_.memory;
+        if (s->svc_.memory) {
+            ms.store_model = hc_memory_model(s->svc_.memory);
+            ms.store_model_assumed = hc_memory_model_adopted(s->svc_.memory) != 0;
+        }
+        ms.state = mem_model_clash      ? hc::ui::MemoryStatus::State::ModelClash
+                   : s->svc_.mbroker    ? hc::ui::MemoryStatus::State::Online
+                                        : hc::ui::MemoryStatus::State::NoEmbedModel;
     }
 
     /* P2.3 security: keep the bus known-fleet filters == the LIVE roster (refreshed by the UI panel AND a

@@ -5,7 +5,11 @@
  *                    write (upsert = a new line, last-wins on rebuild) or {id,deleted} for a forget.
  *   vectors.f32    — the embeddings as raw dim x float32 rows; a record's "row" indexes into it. Raw
  *                    host-endian floats (the store is host-local + ephemeral, so no portable encoding).
- *   meta.json      — {"dim":N}, the store's fixed embedding dimension (adopted on the first write).
+ *   meta.json      — {"dim":N,"model":"<id>"}, the store's fixed embedding dimension AND the embedding
+ *                    model that produced its vectors, both adopted on the first write. The model is
+ *                    recorded because the dimension alone does not identify a vector space: two
+ *                    different models sharing an output dimension arrange meaning by different learned
+ *                    coordinates, so mixing them passes every length check and silently corrupts recall.
  *
  * On open the log is replayed to rebuild an in-RAM index of the LIVE records (latest line per id, minus
  * tombstones), each holding a copied vector + its precomputed L2 norm; queries are a flat exact cosine
@@ -48,6 +52,10 @@ typedef struct {
 struct hc_memory {
     char       root[1024];
     int        dim;       /* 0 until the first write adopts it */
+    char       model[HC_MEM_MODEL_MAX]; /* embedding model recorded in meta.json; "" if none        */
+    char       want[HC_MEM_MODEL_MAX];  /* model the CALLER configured; "" = unknown, no enforcement */
+    int        mismatch;  /* 1 when model[] and want[] disagree -> writes and queries are refused   */
+    int        adopted;   /* 1 when model[] was adopted retroactively, NOT recorded at first write   */
     size_t     vec_rows;  /* physical rows in vectors.f32 (live + orphaned-by-upsert)        */
     size_t     log_bytes; /* current records.jsonl size, to bound growth without a per-write stat */
     mem_entry *entries;   /* the live index */
@@ -185,6 +193,38 @@ static int index_upsert(hc_memory *m, const char *id, const char *scope, const c
     return 0;
 }
 
+/* Write meta.json atomically as {"dim":N,"model":"..."}. Built through hc_json rather than snprintf
+ * because the model id reaches us from configuration: a value carrying a quote or a backslash would
+ * otherwise emit malformed JSON, which reads back as dim 0 on the next open -- silently re-opening the
+ * one-way door this file exists to hold shut. `model` NULL or empty omits the key. */
+/* Printable ASCII only (space..~). Keeps a hostile meta.json from smuggling control bytes into the
+ * host's terminal output; real model ids are lowercase slugs well inside this. */
+static bool printable_id(const char *s)
+{
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s > 0x7e) return false;
+    return true;
+}
+
+static int write_meta(const hc_memory *m, int dim, const char *model, bool adopted)
+{
+    char meta[1200];
+    if ((size_t)snprintf(meta, sizeof meta, "%s/meta.json", m->root) >= sizeof meta) return -1;
+    hc_json *o = hc_json_new_object();
+    if (!o) return -1;
+    int rc = -1;
+    if (hc_json_obj_set_int(o, "dim", dim) && (!model || !model[0] || hc_json_obj_set_str(o, "model", model))
+        && (!adopted || hc_json_obj_set_bool(o, "model_adopted", true))) {
+        char *body = hc_json_print(o, false);
+        if (body) {
+            rc = hc_fs_atomic_write(meta, body, strlen(body));
+            free(body);
+        }
+    }
+    hc_json_free(o);
+    return rc;
+}
+
 /* ---- open / rebuild ---- */
 
 /* Replay the log into the in-RAM index. Returns 0 on success, -1 ONLY on an OOM building the index (the
@@ -203,6 +243,16 @@ static int rebuild(hc_memory *m)
             if (o) {
                 int64_t d = hc_json_get_int(o, "dim", 0);
                 if (d > 0 && d <= HC_MEM_MAX_DIM) m->dim = (int)d;
+                /* Absent in a store written before the field existed -> stays "", meaning "unknown",
+                 * which the write path adopts rather than treating as a disagreement. */
+                /* Only accept a PRINTABLE id. meta.json is attacker-influenceable in this file's own
+                 * threat model, and the host echoes this string to a terminal — control bytes would
+                 * let it forge log lines or inject ANSI into the very message the operator must act
+                 * on. A rejected id reads as absent, which the write path then re-adopts. */
+                const char *mv = hc_json_get_str(o, "model", "");
+                if (mv && strnlen(mv, HC_MEM_MODEL_MAX) < HC_MEM_MODEL_MAX && printable_id(mv))
+                    snprintf(m->model, sizeof m->model, "%s", mv);
+                m->adopted = hc_json_get_bool(o, "model_adopted", false) ? 1 : 0;
                 hc_json_free(o);
             }
             free(md);
@@ -264,19 +314,31 @@ static int rebuild(hc_memory *m)
     return rc;
 }
 
-hc_memory *hc_memory_open(const char *dir)
+hc_memory *hc_memory_open(const char *dir) { return hc_memory_open_model(dir, NULL); }
+
+hc_memory *hc_memory_open_model(const char *dir, const char *model)
 {
     if (!dir || !dir[0]) return NULL;
+    /* An over-long or unprintable id is a configuration error, and returning NULL here would switch
+     * memory off silently — the exact outcome this function's own contract argues against. Open
+     * normally with enforcement OFF; the host validates the id and says so. */
+    const bool usable = model && model[0] && strnlen(model, HC_MEM_MODEL_MAX) < HC_MEM_MODEL_MAX
+                        && printable_id(model);
     hc_memory *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     if ((size_t)snprintf(m->root, sizeof m->root, "%s", dir) >= sizeof m->root || hc_fs_mkdirs(m->root) != 0) {
         free(m);
         return NULL;
     }
+    if (usable) snprintf(m->want, sizeof m->want, "%s", model);
     if (rebuild(m) != 0) { /* an OOM building the index — fail rather than serve a truncated store */
         hc_memory_close(m);
         return NULL;
     }
+    /* Both sides known and disagreeing -> refuse to serve. The open still SUCCEEDS on purpose: the
+     * caller needs a handle to ask WHICH two ids disagree, and a NULL here is indistinguishable from
+     * "memory is switched off" — the very confusion this check exists to end. */
+    m->mismatch = (m->n > 0 && m->model[0] && m->want[0] && strcmp(m->model, m->want) != 0) ? 1 : 0;
     return m;
 }
 
@@ -291,11 +353,16 @@ void hc_memory_close(hc_memory *m)
 int    hc_memory_dim(const hc_memory *m) { return m ? m->dim : 0; }
 size_t hc_memory_count(const hc_memory *m) { return m ? m->n : 0; }
 
+const char *hc_memory_model(const hc_memory *m) { return m ? m->model : ""; }
+int         hc_memory_model_adopted(const hc_memory *m) { return m ? m->adopted : 0; }
+int         hc_memory_model_mismatch(const hc_memory *m) { return m ? m->mismatch : 0; }
+
 /* ---- write ---- */
 
 int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_LEN])
 {
     if (!m || !r || !r->vec || r->dim <= 0 || r->dim > HC_MEM_MAX_DIM) return -1;
+    if (m->mismatch) return -1; /* bound to a different embedding model — see hc_memory_open_model */
     if (!bounded_nonempty(r->scope, HC_MEM_SCOPE_MAX) || !bounded_nonempty(r->text, HC_MEM_TEXT_MAX))
         return -1;
     if (r->source && strnlen(r->source, HC_MEM_SOURCE_MAX) >= HC_MEM_SOURCE_MAX) return -1;
@@ -303,15 +370,21 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
         if (!isfinite(r->vec[i])) return -1;          /* never store a poisoned (NaN/Inf) vector  */
     if (!(l2norm(r->vec, r->dim) > 0.0f)) return -1;  /* nor a degenerate all-zero one (cosine 0) */
 
-    if (m->dim == 0) { /* first write fixes the dimension (one-way door) */
-        char meta[1200], body[64];
-        int  bl = snprintf(body, sizeof body, "{\"dim\":%d}\n", r->dim);
-        if (bl < 0 || (size_t)snprintf(meta, sizeof meta, "%s/meta.json", m->root) >= sizeof meta) return -1;
-        if (hc_fs_atomic_write(meta, body, (size_t)bl) != 0) return -1;
-        m->dim = r->dim;
-    } else if (r->dim != m->dim) {
-        return -1; /* dimension mismatch — rejected */
-    }
+    /* DECIDE the dimension/model commit here, but COMMIT it further down, after every cheap rejection
+     * below has passed. Branding meta.json up here would permanently bind a store whose record then
+     * bounced off the live cap or the log cap — and for the model that is an unrecoverable refusal
+     * (the store insists on an id whose vectors were never written), not a cosmetic wart. */
+    const bool first = (m->dim == 0);
+    if (!first && r->dim != m->dim) return -1; /* dimension mismatch — rejected */
+    /* Adopt: a store written before meta.json carried a model. Its vectors genuinely came from
+     * whatever was configured then, and nothing on disk says otherwise, so adopt rather than condemn
+     * a store that is probably fine. See hc_memory_model_adopted() — the host must not present an
+     * adopted id as though the store had recorded it. */
+    const bool adopt = (!first && !m->model[0] && m->want[0]);
+    /* Rebind: the store holds no LIVE records, so there are no vectors left for a foreign model to be
+     * incomparable with. Refusing forever would strand a store branded by a write that never landed,
+     * or one whose every record has since been forgotten. */
+    const bool rebind = (!first && m->n == 0 && m->want[0] && strcmp(m->model, m->want) != 0);
 
     char id[HC_MEM_ID_LEN];
     compute_id(r->scope, r->text, id);
@@ -341,6 +414,26 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
         || (size_t)snprintf(rpath, sizeof rpath, "%s/records.jsonl", m->root) >= sizeof rpath) {
         free(line);
         return -1;
+    }
+
+    /* Every cheap rejection is behind us; commit the binding now, immediately before the appends.
+     * meta.json is written FIRST of the three so it is never older than the content it describes: a
+     * torn write here leaves a branded store with one fewer record, which rebuild handles, whereas
+     * content without a brand would replay against a dimension the store no longer knows. `bind`
+     * preserves an already-recorded id when this caller configured none, so an unconfigured write can
+     * never erase a binding it does not know about. */
+    if (first || adopt || rebind) {
+        const char *bind = m->want[0] ? m->want : m->model;
+        /* Preserve the existing flag when this caller configured no model: it is not in a position to
+         * say whether the recorded id was witnessed or inferred. */
+        const bool  now_adopted = m->want[0] ? (adopt || rebind) : (m->adopted != 0);
+        if (write_meta(m, first ? r->dim : m->dim, bind, now_adopted) != 0) {
+            free(line);
+            return -1;
+        }
+        if (first) m->dim = r->dim;
+        if (m->want[0]) snprintf(m->model, sizeof m->model, "%s", m->want);
+        m->adopted = now_adopted ? 1 : 0;
     }
     /* append the vector (its physical row is m->vec_rows), then the record line referencing that row.
      * vec_rows tracks the physical file, so a torn write leaves only a harmless orphan row. */
@@ -411,6 +504,7 @@ int hc_memory_query(hc_memory *m, const float *qvec, int dim, const char *const 
     if (out) *out = NULL;
     if (n_out) *n_out = 0;
     if (!m || !qvec || !out || !n_out || dim <= 0) return -1;
+    if (m->mismatch) return -1; /* bound to a different embedding model — scoring would be nonsense */
     if (m->dim == 0 || m->n == 0) return 0; /* empty store */
     if (dim != m->dim) return -1;
     if (max_hits == 0) return 0;
@@ -483,6 +577,13 @@ int hc_memory_forget(hc_memory *m, const char *id)
     if (hc_fs_append(rpath, line, (size_t)ll) != 0) return -1;
     m->log_bytes += (size_t)ll;
     remove_at(m, (size_t)(e - m->entries));
+    /* Emptying the store LIFTS a model mismatch. The refusal exists because foreign vectors cannot be
+     * scored against these ones; with no live records left there are no "these ones", which is exactly
+     * the rebind condition the write path already implements. Without this the two rules disagree: the
+     * open-time latch would keep refusing writes until a restart, and forget() is the very remediation
+     * surface the mismatch deliberately leaves open -- so an operator who did the prescribed thing (drop
+     * the records) would find the store still refusing and nothing on screen saying why. */
+    if (m->mismatch && m->n == 0) m->mismatch = 0;
     return 0;
 }
 

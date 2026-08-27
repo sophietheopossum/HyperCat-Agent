@@ -210,6 +210,19 @@ void Conductor::Impl::process_turn(const std::string &line, bool is_continuation
              * still point at the prior turn's assistant message (and would duplicate it). Mark it visibly stopped. */
             reply = streaming;
             reply += reply.empty() ? "*(stopped)*" : "\n\n*(stopped)*";
+        } else if (st != HC_AGENT_OK) {
+            /* EVERY other failure used to be invisible. reply fell through to hc_agent_last_text(), which after a
+             * failed call is empty or STILL POINTS AT THE PRIOR TURN — so a timeout showed up as a blank message
+             * or a duplicate of the last one, and the operator had nothing to act on. A real one cost an
+             * afternoon to attribute. Same `streaming`-over-last_text reasoning as the cancel branch above.
+             *
+             * The transport cause is named where there is one: the agent collapses timeout, HTTP error, non-2xx
+             * and unparseable body into a single code, and those are different problems with different fixes
+             * (raise the call timeout / back off / report a provider bug). The worker path does this too. */
+            std::string err = std::string("*(") + hc_agent_status_str(st);
+            if (st == HC_AGENT_ERR_LLM) err += std::string(": ") + hc_llm_status_str(hc_agent_last_llm_status(agent));
+            err += ")*";
+            reply = streaming.empty() ? err : (streaming + "\n\n" + err);
         }
         push_turn("assistant", reply, now_ms());
         streaming.clear();

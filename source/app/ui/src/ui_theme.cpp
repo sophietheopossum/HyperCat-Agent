@@ -100,10 +100,26 @@ const char *load_fonts()
         const char *family;
         const char *path;
     };
+    /* Distro font layouts differ, and this list used to know only Debian's. On Arch (/usr/share/fonts/TTF)
+     * and Fedora (/usr/share/fonts/<pkg>) every candidate missed, the chain fell through to ImGui's
+     * built-in default, and that default is a BITMAP face drawn for exactly 13px -- so under a compositor
+     * doing fractional scaling (1.25 is common) it was rasterised at 16.25px and looked blurry. Reported
+     * from an Arch desktop and reproduced by inspection: the typography was never the problem, the paths
+     * were. Order is preference, not availability: JetBrains Mono first everywhere (10-ui-and-theme names
+     * it as the single UI font), then a monospace fallback, and only then a proportional one. */
     static const Cand candidates[] = {
-        {"JetBrains Mono", "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"},
-        {"JetBrains Mono", "/usr/local/share/fonts/JetBrainsMono-Regular.ttf"},
-        {"DejaVu Sans Mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"},
+        {"JetBrains Mono", "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf"}, /* Debian */
+        {"JetBrains Mono", "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"},                     /* Arch   */
+        {"JetBrains Mono", "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf"},             /* Arch   */
+        {"JetBrains Mono", "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Regular.ttf"},    /* Fedora */
+        {"JetBrains Mono", "/usr/local/share/fonts/JetBrainsMono-Regular.ttf"},                   /* manual */
+        {"JetBrains Mono", "/Library/Fonts/JetBrainsMono-Regular.ttf"},                           /* macOS  */
+        {"DejaVu Sans Mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"},              /* Debian */
+        {"DejaVu Sans Mono", "/usr/share/fonts/TTF/DejaVuSansMono.ttf"},                          /* Arch   */
+        {"DejaVu Sans Mono", "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf"},       /* Fedora */
+        {"Liberation Mono", "/usr/share/fonts/liberation/LiberationMono-Regular.ttf"},            /* Arch   */
+        {"Liberation Mono", "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf"},   /* Debian */
+        {"Menlo", "/System/Library/Fonts/Menlo.ttc"},                                             /* macOS  */
     };
     /* AddFontFromFileTTF ASSERTS on a missing file (it does not return null), so confirm the file
      * exists before calling it. Fall back through the chain, then ImGui's built-in default. */
@@ -118,8 +134,13 @@ const char *load_fonts()
         }
     }
     if (!family) {
-        io.Fonts->AddFontDefault();
-        family = "ImGui default";
+        /* The last resort must still be a VECTOR face. AddFontDefault() picks between an embedded scalable
+         * font and the classic pixel-clean bitmap one by inspecting scale factors this app does not set,
+         * so on an old-style codebase it lands on the bitmap -- crisp at exactly 13px, blurry at every
+         * fractional scale. Ask for the scalable one explicitly: a system with no usable TTF at all then
+         * still renders cleanly at any density, instead of looking broken. */
+        io.Fonts->AddFontDefaultVector();
+        family = "ImGui default (vector)";
     }
     /* Merge a broad-coverage fallback into the base face so the agent's kaomoji render instead of missing-glyph
      * boxes. JetBrains Mono is a coding font and lacks the decorative codepoints kaomoji use (Greek omega,
@@ -130,8 +151,11 @@ const char *load_fonts()
      * kaomoji are the AGENT voice, not the restrained-corporate UI chrome, so widening their coverage is in line
      * with the persona canon. UI-thread / pre-first-frame only. */
     static const char *const fallback_paths[] = {
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",   /* Debian */
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",        /* Arch   */
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", /* Fedora */
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",          /* Debian */
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",                      /* Arch   */
     };
     for (const char *path : fallback_paths) {
         FILE *f = std::fopen(path, "rb");
@@ -143,9 +167,12 @@ const char *load_fonts()
     }
     /* Optional Bold face (markdown headings/bold). Same exists-before-load guard; null => regular fallback. */
     static const char *const bold_paths[] = {
-        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf",
-        "/usr/local/share/fonts/JetBrainsMono-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf", /* Debian */
+        "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",                     /* Arch   */
+        "/usr/share/fonts/jetbrains-mono-fonts/JetBrainsMono-Bold.ttf",    /* Fedora */
+        "/usr/local/share/fonts/JetBrainsMono-Bold.ttf",                   /* manual */
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",        /* Debian */
+        "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",                    /* Arch   */
     };
     for (const char *path : bold_paths) {
         FILE *f = std::fopen(path, "rb");

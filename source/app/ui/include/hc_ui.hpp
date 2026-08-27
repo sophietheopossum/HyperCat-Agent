@@ -87,6 +87,22 @@ struct MemoryRow {
     std::string source; /* provenance: "operator" | "session:..." | "distill:..." */
 };
 
+/* Why the Memory panel has nothing to show. Without this the panel falls back to "no memories yet",
+ * which is wrong in two of these three states -- and dangerously wrong in the third, where a store that
+ * is REFUSING to serve records it actually holds looks identical to one that is simply empty. */
+struct MemoryStatus {
+    enum class State {
+        Online,       /* the recall broker is running; the rows are the store's real contents      */
+        NoEmbedModel, /* nothing configured -> no broker at all, so memory cannot be read OR written */
+        ModelClash,   /* the store's vectors came from another embedding model; it refuses to serve */
+    };
+    State       state = State::NoEmbedModel;
+    std::string store_model;                 /* embedding model recorded in (or assumed for) the store */
+    std::string config_model;                /* what is configured now (Settings > Provider)           */
+    bool        store_model_assumed = false; /* store_model was ADOPTED, never witnessed in use         */
+    std::string store_path;                  /* the directory to delete to start over                  */
+};
+
 /* A pending tool-authorization request awaiting a human verdict (Phase C). A worker's tool blocks on a
  * tool.authorize bus req; the host's AuthGate queues it and surfaces it here; the approvals panel shows
  * `summary` — untrusted, model-influenced text rendered verbatim, NEVER interpreted — with allow/deny,
@@ -199,7 +215,7 @@ struct UiSettings {
     int    poll_hz = 2;
     bool   mascot = false;
     /* provider — applied on restart (the panel tags it) */
-    std::string model, base_url, embed_model;
+    std::string model, base_url, embed_model, reasoning_effort;
     /* paths — applied on restart */
     std::string data_dir;
     bool        ephemeral = false;
@@ -212,6 +228,8 @@ struct UiSettings {
     bool                     key_present = false;        /* hc_secrets holds the provider key          */
     bool                     keychain_available = false; /* an OS keychain is reachable (persist works) */
     bool                     export_key_to_env = false;  /* SECURITY: re-expose key to worker env (OFF) */
+    bool                     notify_approvals = false;   /* desktop notification per approval (OFF)      */
+    bool                     notify_available = false;   /* this BUILD can notify (gio present; Linux)   */
     /* automation (B3/B4) — delegated-approval opt-ins; BOTH default OFF, the human gate stays the floor */
     bool                     auto_approve_contained = false; /* auto-approve sandbox-contained writes only */
     bool                     allow_all_approvals = false;    /* auto-approve EVERYTHING (armed via consent modal) */
@@ -220,7 +238,8 @@ struct UiSettings {
     std::vector<UiModelEntry>                        models;      /* the operator's catalog ({id,note}) */
     std::vector<std::pair<std::string, std::string>> role_models; /* role -> model id (the assignment grid) */
     /* env-override locks — a set env var WINS over the file; the field renders disabled with a note */
-    bool ov_model = false, ov_base_url = false, ov_embed_model = false, ov_data_dir = false,
+    bool ov_model = false, ov_base_url = false, ov_embed_model = false, ov_reasoning_effort = false,
+         ov_data_dir = false,
          ov_ephemeral = false, ov_llm_call_total_ms = false, ov_llm_connect_ms = false,
          ov_deep_reason_budget = false, ov_task_deadline_ms = false, ov_egress_allow = false;
     /* conductor personality (Wave A) — the operator-editable VOICE slot. The persona is LIVE-OWNED: the
@@ -409,6 +428,7 @@ struct UiSnapshot {
     std::vector<UsageStat>    usage_by_agent;                /* the Dashboard usage breakdown     */
     std::vector<EgressRow>    egress;                        /* P08.2: recent egress decisions (Network panel) */
     std::vector<MemoryRow>    memory;                        /* the fleet's semantic memory (P01) */
+    MemoryStatus              memory_status;                 /* why `memory` is empty, when it is */
     SysStat                   sysstat;                       /* host process CPU/RSS/uptime (WI-3) */
     UiSettings                settings;                      /* the operator settings panel state (WI-2) */
     /* The conductor chat surface (Conductor P5) — the host fills these from Conductor::snapshot() each frame. */
@@ -554,6 +574,10 @@ public:
 
     /* True once the user picked File -> Quit; the host loop should break + tear down. */
     bool wants_quit() const;
+
+    /* Mark the window as wanting attention — paired with the approval notification, for the case where
+     * the operator is looking at another window entirely. Harmless when the compositor ignores it. */
+    void request_attention();
 
     /* Headless capture only: focus a named window's tab so a screenshot shows it (it may share a dock node
      * with others and not be the default selection). One-shot — re-arm before each screenshot(). No effect on

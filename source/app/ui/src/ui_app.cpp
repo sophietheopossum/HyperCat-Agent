@@ -97,6 +97,11 @@ std::vector<std::string> UiApp::drain_dropped_paths()
 
 bool UiApp::wants_quit() const { return p_->ctx.want_quit; }
 
+void UiApp::request_attention()
+{
+    if (p_->backend) p_->backend->request_attention();
+}
+
 void UiApp::pin_window(const char *window) { p_->ctx.focus_window = window ? window : ""; } /* capture: focus a tab */
 void UiApp::pin_dashboard_tab() { pin_window("Dashboard"); } /* headless capture: select Dashboard (P12) */
 

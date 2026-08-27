@@ -9,7 +9,7 @@
  *    "paths":{"data_dir":"","ephemeral":false},
  *    "limits":{"llm_call_total_ms":120000,"llm_connect_ms":10000,"deep_reason_budget":4,"task_deadline_ms":300000},
  *    "security":{"egress_allow":["192.168.1.50", ...]},
- *    "automation":{"auto_approve_contained":false,"allow_all_approvals":false}}
+ *    "automation":{"auto_approve_contained":false,"allow_all_approvals":false,"notify_approvals":false}}
  * panels is an ARRAY of {n,v} (not an object) so the codec needs no hardcoded panel names — a new panel
  * round-trips without touching this file. Unknown keys are ignored; absent keys keep the in/out default. */
 
@@ -101,6 +101,7 @@ bool settings_parse(const char *json, size_t len, Settings &out)
         out.model = hc_json_get_str(prov, "model", out.model.c_str());
         out.base_url = hc_json_get_str(prov, "base_url", out.base_url.c_str());
         out.embed_model = hc_json_get_str(prov, "embed_model", out.embed_model.c_str());
+        out.reasoning_effort = hc_json_get_str(prov, "reasoning_effort", out.reasoning_effort.c_str());
     }
 
     if (const hc_json *paths = hc_json_get(root, "paths")) {
@@ -205,6 +206,7 @@ bool settings_parse(const char *json, size_t len, Settings &out)
     if (const hc_json *at = hc_json_get(root, "automation")) {
         out.auto_approve_contained = hc_json_get_bool(at, "auto_approve_contained", out.auto_approve_contained);
         out.allow_all_approvals = hc_json_get_bool(at, "allow_all_approvals", out.allow_all_approvals);
+        out.notify_approvals = hc_json_get_bool(at, "notify_approvals", out.notify_approvals);
     }
 
     hc_json_free(root);
@@ -240,6 +242,7 @@ std::string settings_serialize(const Settings &s)
         hc_json_obj_set_str(prov, "model", s.model.c_str());
         hc_json_obj_set_str(prov, "base_url", s.base_url.c_str());
         hc_json_obj_set_str(prov, "embed_model", s.embed_model.c_str());
+        hc_json_obj_set_str(prov, "reasoning_effort", s.reasoning_effort.c_str());
         hc_json_obj_set(root, "provider", prov);
     }
     if (hc_json *paths = hc_json_new_object()) {
@@ -326,6 +329,7 @@ std::string settings_serialize(const Settings &s)
     if (hc_json *at = hc_json_new_object()) { /* automation (B3/B4): the delegated-approval opt-ins */
         hc_json_obj_set_bool(at, "auto_approve_contained", s.auto_approve_contained);
         hc_json_obj_set_bool(at, "allow_all_approvals", s.allow_all_approvals);
+        hc_json_obj_set_bool(at, "notify_approvals", s.notify_approvals);
         hc_json_obj_set(root, "automation", at);
     }
 
@@ -454,6 +458,10 @@ Settings settings_merge_env(const Settings &base, EnvOverrides &ov)
     if (const char *v = getenv("HC_EMBED_MODEL")) {
         s.embed_model = v;
         ov.embed_model = true;
+    }
+    if (const char *v = getenv("HC_REASONING_EFFORT")) {
+        s.reasoning_effort = v;
+        ov.reasoning_effort = true;
     }
     if (const char *v = getenv("HC_DATA_DIR")) {
         s.data_dir = v;

@@ -213,12 +213,60 @@ static void test_embeddings(void)
     CHECK(hc_llm_parse_embeddings("not json", 8, 1, &vecs, &dim) == -1 && !vecs, "reject non-JSON");
 }
 
+/* reasoning_effort: the field must be OMITTED unless the value is one the providers actually take.
+ * Both halves matter. Emitting it always would change the request body for every existing install --
+ * including local OpenAI-compatible servers that reject unknown parameters outright. Forwarding an
+ * unrecognised value would turn one typo in a settings box into a 400 on every call. */
+static void test_reasoning_effort(void)
+{
+    hc_llm_message msgs[1] = {{"user", "hi", NULL, NULL}};
+
+    /* absent by default -- the plain builder must be byte-identical to a NULL effort */
+    char *plain = hc_llm_build_request_json("m", msgs, 1, NULL, false);
+    char *nul = hc_llm_build_request_json_ex("m", msgs, 1, NULL, false, NULL);
+    char *empty = hc_llm_build_request_json_ex("m", msgs, 1, NULL, false, "");
+    CHECK(plain && nul && strcmp(plain, nul) == 0, "effort: NULL builds the pre-existing body");
+    CHECK(empty && nul && strcmp(empty, nul) == 0, "effort: \"\" builds the pre-existing body");
+    CHECK(plain && strstr(plain, "reasoning_effort") == NULL, "effort: absent when unset");
+    free(plain);
+    free(nul);
+    free(empty);
+
+    /* every accepted level round-trips into the body */
+    static const char *const ok[] = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+    for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+        char *b = hc_llm_build_request_json_ex("m", msgs, 1, NULL, false, ok[i]);
+        CHECK(b != NULL, "effort: builder returns a body");
+        if (!b) continue;
+        hc_json *root = hc_json_parse(b, strlen(b));
+        CHECK(root && strcmp(hc_json_get_str(root, "reasoning_effort", ""), ok[i]) == 0,
+              "effort: accepted level reaches the body");
+        if (root) hc_json_free(root);
+        free(b);
+    }
+
+    /* anything else is dropped, NOT forwarded -- a typo costs the provider default, not a 400 */
+    static const char *const bad[] = {"MEDIUM", "medium ", "hi", "1", "\"}, \"x\":\"y"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        char *b = hc_llm_build_request_json_ex("m", msgs, 1, NULL, false, bad[i]);
+        CHECK(b != NULL, "effort: an unrecognised level still builds a body");
+        if (!b) continue;
+        CHECK(strstr(b, "reasoning_effort") == NULL, "effort: unrecognised level is dropped");
+        /* and it must not have escaped into the JSON as anything else */
+        hc_json *root = hc_json_parse(b, strlen(b));
+        CHECK(root != NULL, "effort: body still parses after a hostile level");
+        if (root) hc_json_free(root);
+        free(b);
+    }
+}
+
 int main(void)
 {
     test_request_builder();
     test_decoder();
     test_usage_sanitize();
     test_embeddings();
+    test_reasoning_effort();
 
     if (g_fails) {
         fprintf(stderr, "hc_llm: %d check(s) failed\n", g_fails);

@@ -46,6 +46,7 @@ extern "C" {
 #define HC_MEM_TEXT_MAX   (8u * 1024u) /* one memory record's text cap (untrusted)               */
 #define HC_MEM_MAX_DIM    16384        /* defensive upper bound on the embedding dimension        */
 #define HC_MEM_MAX_HITS   256          /* cap on rows a single query may return                   */
+#define HC_MEM_MODEL_MAX  256          /* embedding model id recorded in meta.json (incl. NUL)    */
 
 typedef struct hc_memory hc_memory;
 
@@ -75,7 +76,59 @@ typedef struct {
 /* Open (creating if absent) a memory store rooted at `dir` (a host-private directory). The dimension is
  * adopted from the first write and persisted; a store reopened keeps it. NULL on failure. */
 hc_memory *hc_memory_open(const char *dir);
+
+/* As hc_memory_open, but also binds the store to the embedding model that produced its vectors.
+ *
+ * WHY THIS EXISTS: the dimension check alone is not a safety property. Two DIFFERENT embedding models
+ * that happen to share an output dimension produce entirely incompatible vector spaces -- each arranges
+ * meaning by its own learned coordinates -- so mixing them passes every length check and silently
+ * returns nonsense from recall. The loud failure (a dimension mismatch) was always the harmless one;
+ * this closes the quiet one.
+ *
+ * `model` is the caller's CONFIGURED embedding model id (NULL or "" = unknown, no enforcement, exactly
+ * the old behaviour). On the first write it is persisted into meta.json alongside the dimension. If the
+ * store already records a DIFFERENT id AND holds at least one live record, the store opens in a
+ * refusing state: hc_memory_write and hc_memory_query fail with -1 and hc_memory_model_mismatch()
+ * reports 1, so the host can say which two ids disagree instead of serving corrupt recall. Opening
+ * still succeeds so that the caller can report the problem -- returning NULL here would be
+ * indistinguishable from "memory is switched off", which is precisely the diagnosis this exists to
+ * make possible. For that same reason an over-long or unprintable `model` does NOT fail the open: it
+ * is a configuration error, so the store opens with enforcement OFF and the host is expected to
+ * validate the id and report it.
+ *
+ * NOT gated by a mismatch: hc_memory_list and hc_memory_forget stay legal, deliberately. They are the
+ * remediation surface -- an operator must be able to see and drop what is in a store they can no
+ * longer query. Only the two operations that would score or add vectors are refused.
+ *
+ * REBIND: a store with no live records (never successfully written, or everything since forgotten) has
+ * no vectors for a foreign model to be incomparable with, so it rebinds on the next write instead of
+ * refusing forever. A store that was already refusing when it was opened stops refusing the moment
+ * hc_memory_forget drops its last record -- remediation through the panel therefore works without a
+ * restart. Note this covers only the model; the DIMENSION remains a one-way door, because
+ * vectors.f32 is a flat array of fixed-width rows and re-adopting a width would misalign every
+ * existing row. A store stuck on an unwanted dimension must be deleted.
+ *
+ * ADOPT: a store written before this field existed records no model; it adopts the configured one on
+ * its next write rather than being condemned, since its vectors are in fact from whatever model was in
+ * use then. That id is an ASSUMPTION, not a record -- hc_memory_model_adopted() reports 1 for it, and
+ * a host must not present it to a user as though the store had witnessed it. */
+hc_memory *hc_memory_open_model(const char *dir, const char *model);
+
 void       hc_memory_close(hc_memory *);
+
+/* The embedding model id recorded in the store, or "" if none is recorded (a pre-model store, or one
+ * that has never been written to). Borrowed, valid until hc_memory_close. */
+const char *hc_memory_model(const hc_memory *);
+
+/* 1 when the configured model disagrees with the one recorded in the store -- hc_memory_write and
+ * hc_memory_query are being refused (list/forget are not). 0 otherwise. Pair with hc_memory_model()
+ * to report both sides. */
+int hc_memory_model_mismatch(const hc_memory *);
+
+/* 1 when hc_memory_model() was ADOPTED retroactively (a store predating the field, or one rebound
+ * while empty) rather than recorded at the store's own first write. The id is then this library's
+ * assumption about vectors it did not witness being made, so report it as such. */
+int hc_memory_model_adopted(const hc_memory *);
 
 /* The store's fixed embedding dimension, or 0 if nothing has been written yet. */
 int    hc_memory_dim(const hc_memory *);
@@ -83,7 +136,8 @@ int    hc_memory_dim(const hc_memory *);
 size_t hc_memory_count(const hc_memory *);
 
 /* Upsert a memory (dedup by content id = hash(scope|text); an existing id is refreshed). Sets the
- * store's dimension on the first write; a later write whose `dim` differs is REJECTED. id_out (optional;
+ * store's dimension AND embedding model on the first write; a later write whose `dim` differs, or which
+ * is made against a store bound to a different embedding model, is REJECTED. id_out (optional;
  * HC_MEM_ID_LEN incl. NUL) receives the content id. 0 on success, -1 on a bad arg / dim mismatch /
  * non-finite-or-zero vector / a bound exceeded (text/scope too long, the live or log cap reached) / I/O
  * failure. NOTE on the one durability subtlety: if the bytes were written but the in-RAM index update

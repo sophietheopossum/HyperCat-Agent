@@ -98,6 +98,9 @@ struct HostServices {
     hc_artifacts           *artifacts = nullptr; /* content-addressed output store + provenance (P02) */
     hc_memory              *memory = nullptr;    /* the semantic-memory store (P01)                   */
     hc::host::MemoryBroker *mbroker = nullptr;   /* the recall bus service (owns the embed client)    */
+    hc::ui::MemoryStatus    mem_status;          /* WHY memory is or is not available — the Memory
+                                                  * panel must not render a refusing store as an empty
+                                                  * one. Set once, where the store is opened.        */
     hc_pty                 *pty = nullptr;       /* the operator terminal's shell (visible UI only)   */
     SettingsState          *settings = nullptr;  /* the operator settings + key store (WI-2 E1)       */
     RoleState              *roles = nullptr;     /* the editable worker role templates (Worker Builder, P2.3b) */
@@ -164,9 +167,14 @@ void fill_usage(hc::ui::UiSnapshot &, hc::host::UiAdapter *);
  * the live loop + the capture branch (so they never drift). No-op if the adapter is null. */
 void fill_egress(hc::ui::UiSnapshot &, hc::host::UiAdapter *);
 
-/* P01: fill the snapshot's Memory panel rows from the recall broker's store (most-recent-first, bounded).
- * Shared by the live loop + the capture branch. No-op if the broker is null (offline / no embeddings). */
-void fill_memory(hc::ui::UiSnapshot &, hc::host::MemoryBroker *);
+/* P01: fill the snapshot's Memory panel rows from the recall broker's store (most-recent-first, bounded),
+ * plus the status that explains an EMPTY panel (a refusing store must never read as an empty one).
+ * Shared by the live loop + the capture branch. A null broker fills the status and no rows.
+ *
+ * Takes the two things it uses, not the whole HostServices: a filler that receives the service aggregate
+ * can silently start reaching for anything in it, which is how a service struct turns into a God Object.
+ * The narrow signature also keeps this callable from a test with no host at all. */
+void fill_memory(hc::ui::UiSnapshot &, hc::host::MemoryBroker *, const hc::ui::MemoryStatus &);
 
 /* W3 P3.2: fill the snapshot's Projects panel list (+ the active project's display name) from the project index.
  * No-op if the index is null (ephemeral degraded path). Host thread only (hc_projects is not thread-safe). */

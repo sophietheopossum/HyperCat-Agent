@@ -27,6 +27,7 @@ struct hc_llm {
     char probe_port[16];
     const char *const *extra_headers; /* borrowed */
     char reasoning_effort[16];        /* "" = omit the field */
+    char *extra_body_json;            /* owned copy; NULL = omit (see hc_llm_provider) */
     hc_llm_usage last_usage;          /* the most recent call's token/cost usage (P12)      */
     hc_llm_usage total_usage;         /* running total of reported usage across all calls    */
 };
@@ -74,6 +75,47 @@ char *hc_llm_build_request_json(const char *model, const hc_llm_message *msgs, s
                                 const char *tools_json, bool stream)
 {
     return hc_llm_build_request_json_ex(model, msgs, n_msgs, tools_json, stream, NULL);
+}
+
+/* As hc_llm_build_request_json_ex, plus `extra_body_json`: a JSON object whose keys are merged onto
+ * the request root. Kept as a separate entry point so the existing two-arity API is untouched. */
+char *hc_llm_build_request_json_ex2(const char *model, const hc_llm_message *msgs, size_t n_msgs,
+                                    const char *tools_json, bool stream, const char *reasoning_effort,
+                                    const char *extra_body_json)
+{
+    char *base = hc_llm_build_request_json_ex(model, msgs, n_msgs, tools_json, stream, reasoning_effort);
+    if (!base || !extra_body_json || !extra_body_json[0]) return base;
+    /* Validate FIRST: only splice text we have proved is a JSON object. Malformed extra JSON must
+     * never lose the request -- fall back to the un-merged body rather than sending garbage. */
+    hc_json *add = hc_json_parse(extra_body_json, strlen(extra_body_json));
+    bool ok = add && hc_json_is_object(add);
+    if (add) hc_json_free(add);
+    if (!ok) return base;
+
+    /* Textual splice rather than a tree merge: both sides are validated objects, so
+     * `{...base...}` + `,` + `...extra...}` is well-formed by construction. hc_json has no merge
+     * primitive, and adding one to a second shared library for this single caller is not worth it. */
+    size_t bl = strlen(base);
+    while (bl > 0 && (base[bl - 1] == ' ' || base[bl - 1] == '\n' || base[bl - 1] == '\t')) bl--;
+    if (bl < 2 || base[bl - 1] != '}') return base;
+
+    const char *ex = extra_body_json;
+    while (*ex == ' ' || *ex == '\n' || *ex == '\t') ex++;
+    if (*ex != '{') return base;
+    ex++; /* past the opening brace */
+    const char *scan = ex;
+    while (*scan == ' ' || *scan == '\n' || *scan == '\t') scan++;
+    if (*scan == '}') return base; /* an empty object would splice a trailing comma */
+
+    size_t el = strlen(ex);
+    char *out = malloc(bl - 1 + 1 + el + 1);
+    if (!out) return base;
+    memcpy(out, base, bl - 1);            /* base without its closing brace */
+    out[bl - 1] = ',';
+    memcpy(out + bl, ex, el);             /* extra without its opening brace (keeps its closing one) */
+    out[bl + el] = '\0';
+    free(base);
+    return out;
 }
 
 char *hc_llm_build_request_json_ex(const char *model, const hc_llm_message *msgs, size_t n_msgs,
@@ -159,6 +201,9 @@ hc_llm *hc_llm_new(const hc_llm_provider *cfg, hc_http *http)
     snprintf(l->probe_port, sizeof l->probe_port, "%s", cfg->probe_port ? cfg->probe_port : "443");
     snprintf(l->reasoning_effort, sizeof l->reasoning_effort, "%s",
              cfg->reasoning_effort ? cfg->reasoning_effort : "");
+    l->extra_body_json = (cfg->extra_body_json && cfg->extra_body_json[0])
+                             ? strdup(cfg->extra_body_json)
+                             : NULL;
     l->extra_headers = cfg->extra_headers;
     l->last_usage.input_tokens = l->last_usage.output_tokens = l->last_usage.total_tokens = -1;
     return l;
@@ -201,8 +246,9 @@ hc_llm_status hc_llm_chat_stream(hc_llm *l, const hc_llm_message *msgs, size_t n
 {
     if (!l || !msgs) return HC_LLM_ERR_INVALID;
 
-    char *body = hc_llm_build_request_json_ex(l->model, msgs, n_msgs, tools_json, true,
-                                              l->reasoning_effort[0] ? l->reasoning_effort : NULL);
+    char *body = hc_llm_build_request_json_ex2(l->model, msgs, n_msgs, tools_json, true,
+                                               l->reasoning_effort[0] ? l->reasoning_effort : NULL,
+                                               l->extra_body_json);
     if (!body) return HC_LLM_ERR_PARSE;
 
     char auth[300];

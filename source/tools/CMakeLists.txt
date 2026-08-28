@@ -46,3 +46,10 @@ if(TARGET hc::toolhost)
   target_link_libraries(genlock PRIVATE hc::toolhost hc::bus hc::tooling hc::json hc::fs hc::hash
                         Threads::Threads hc_warnings hc_sanitizers)
 endif()
+
+# hc_toolbench — per-call tool-schema validity as a chain lengthens, across providers. Dev-time
+# only; nothing in app/ or agentd/ links it. Drives hc_agent with deterministic stub tools, so a run
+# touches no network beyond the model call. Sanitizers KEPT (unlike png2qoi): this tool's output is
+# DATA someone draws conclusions from, and next to LLM latency the overhead is unmeasurable.
+add_executable(hc_toolbench hc_toolbench.c)
+target_link_libraries(hc_toolbench PRIVATE hc_agent hc::json hc::http hc_warnings hc_sanitizers)

@@ -455,9 +455,10 @@ std::string wrap_provider_json(const std::string &inner)
         hc_json_free(parsed);
         return {};
     }
-    if (!hc_json_obj_set(root, "provider", parsed)) { /* adopts on success only */
-        hc_json_free(parsed);
-        hc_json_free(root);
+    /* obj_set ADOPTS on success and FREES `parsed` on failure (hc_json.h:19-21), so the failure path
+     * releases only the parent -- freeing the child here would double-free it. */
+    if (!hc_json_obj_set(root, "provider", parsed)) {
+        hc_json_free(root); /* do NOT free `parsed` again */
         return {};
     }
     char       *text = hc_json_print_canonical(root);

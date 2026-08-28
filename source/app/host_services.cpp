@@ -1824,7 +1824,26 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
         hc_http_global_shutdown(); /* balance the init (refcounted; other clients keep their own ref) */
         return nullptr;
     }
-    hc_http_set_timeouts_ms(http, 60000, 10000);
+    /* Honour the operator's configured limits. This was hardcoded to 60s, which silently overrode
+     * Settings > Limits (default 120s) for every call made through here -- the conductor and the planner.
+     * A reasoning model can spend a minute purely on reasoning tokens before emitting any output, so the
+     * cap was cancelling turns mid-thought while the UI claimed a 120s budget. Same clamps as the worker
+     * path in agentd/worker.cpp, so the two agree on what a legal window is. */
+    /* Read directly rather than pull libs/hc_util onto this target for two integers. */
+    auto env_ms = [](const char *name, int defv) {
+        const char *v = std::getenv(name);
+        if (!v || !*v) return defv;
+        char      *end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        return (end && *end == '\0' && n > 0 && n < 100000000L) ? (int)n : defv;
+    };
+    int call_ms = env_ms("HC_LLM_CALL_TOTAL_MS", 120000);
+    int conn_ms = env_ms("HC_LLM_CONNECT_MS", 10000);
+    if (call_ms < 5000) call_ms = 5000;
+    else if (call_ms > 600000) call_ms = 600000;
+    if (conn_ms < 1000) conn_ms = 1000;
+    else if (conn_ms > 60000) conn_ms = 60000;
+    hc_http_set_timeouts_ms(http, call_ms, conn_ms);
     static const char *hdrs[] = {"HTTP-Referer: https://hypercat.local", "X-Title: HyperCat", nullptr};
     hc_llm_provider    p = {};
     p.name = "openrouter";

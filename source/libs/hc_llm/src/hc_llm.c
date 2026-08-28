@@ -85,35 +85,46 @@ char *hc_llm_build_request_json_ex2(const char *model, const hc_llm_message *msg
 {
     char *base = hc_llm_build_request_json_ex(model, msgs, n_msgs, tools_json, stream, reasoning_effort);
     if (!base || !extra_body_json || !extra_body_json[0]) return base;
-    /* Validate FIRST: only splice text we have proved is a JSON object. Malformed extra JSON must
-     * never lose the request -- fall back to the un-merged body rather than sending garbage. */
+    /* Validate, then splice the RE-EMITTED text -- never the caller's original bytes.
+     *
+     * Parsing alone proves nothing about the rest of the string: cJSON stops at the root value and
+     * ACCEPTS trailing content, so `{"a":1} JUNK` passes an is_object gate. Splicing from the original
+     * buffer then copied to its NUL -- `strlen` past the object's closing brace -- and pasted that tail
+     * into the request body. Printing the parsed TREE is what bounds the text to the object we actually
+     * validated; it also normalises whitespace, so the brace-hunting the old form needed goes away.
+     * Malformed extra JSON must never lose the request -- fall back to the un-merged body. */
     hc_json *add = hc_json_parse(extra_body_json, strlen(extra_body_json));
-    bool ok = add && hc_json_is_object(add);
-    if (add) hc_json_free(add);
-    if (!ok) return base;
+    if (!add || !hc_json_is_object(add)) {
+        if (add) hc_json_free(add);
+        return base;
+    }
+    char *canon = hc_json_print_canonical(add);
+    hc_json_free(add);
+    if (!canon) return base;
 
-    /* Textual splice rather than a tree merge: both sides are validated objects, so
+    /* Textual splice rather than a tree merge: both sides are now objects in canonical text, so
      * `{...base...}` + `,` + `...extra...}` is well-formed by construction. hc_json has no merge
      * primitive, and adding one to a second shared library for this single caller is not worth it. */
     size_t bl = strlen(base);
     while (bl > 0 && (base[bl - 1] == ' ' || base[bl - 1] == '\n' || base[bl - 1] == '\t')) bl--;
-    if (bl < 2 || base[bl - 1] != '}') return base;
+    const size_t cl = strlen(canon); /* canonical: exactly "{...}", no padding, no tail */
+    if (bl < 2 || base[bl - 1] != '}' || cl < 2 || canon[0] != '{' || canon[cl - 1] != '}' ||
+        cl == 2 /* "{}" would splice a trailing comma */) {
+        free(canon);
+        return base;
+    }
 
-    const char *ex = extra_body_json;
-    while (*ex == ' ' || *ex == '\n' || *ex == '\t') ex++;
-    if (*ex != '{') return base;
-    ex++; /* past the opening brace */
-    const char *scan = ex;
-    while (*scan == ' ' || *scan == '\n' || *scan == '\t') scan++;
-    if (*scan == '}') return base; /* an empty object would splice a trailing comma */
-
-    size_t el = strlen(ex);
-    char *out = malloc(bl - 1 + 1 + el + 1);
-    if (!out) return base;
-    memcpy(out, base, bl - 1);            /* base without its closing brace */
+    const size_t el = cl - 1; /* past the opening brace, up to and including the closing one */
+    char        *out = malloc(bl - 1 + 1 + el + 1);
+    if (!out) {
+        free(canon);
+        return base;
+    }
+    memcpy(out, base, bl - 1); /* base without its closing brace */
     out[bl - 1] = ',';
-    memcpy(out + bl, ex, el);             /* extra without its opening brace (keeps its closing one) */
+    memcpy(out + bl, canon + 1, el); /* extra without its opening brace (keeps its closing one) */
     out[bl + el] = '\0';
+    free(canon);
     free(base);
     return out;
 }

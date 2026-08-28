@@ -58,7 +58,13 @@ typedef struct {
      * field for. The concrete need: OpenRouter pins an endpoint with
      * {"provider":{"only":["DeepInfra"],"allow_fallbacks":false}}, and without it a benchmark
      * comparing quantisations silently measures whichever endpoint the router happened to pick.
-     * Must be a JSON OBJECT; its keys are copied onto the request root and override nothing we set.
+     * Must be a JSON OBJECT. Only the object itself is used: the value is re-emitted from the parsed
+     * tree, so anything after its closing brace is discarded rather than pasted into the body.
+     * Its keys are merged onto the request root and land AFTER ours, so a key we already set (model,
+     * messages, stream, stream_options, tools, reasoning_effort) would WIN under last-key-wins. The
+     * library does not reject that -- hc_json has no key iterator to enumerate against -- so a caller
+     * assembling this from operator input must guarantee the shape it passes. Both in-tree callers do,
+     * by CONSTRUCTING `{"provider":<value>}` as a tree instead of concatenating text.
      * COPIED by hc_llm_new, so the caller's buffer need not outlive the client (unlike extra_headers).
      * Invalid JSON is dropped and the request is built without it -- never failed outright. */
     const char *extra_body_json;

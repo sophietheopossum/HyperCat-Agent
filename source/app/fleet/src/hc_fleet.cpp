@@ -86,6 +86,20 @@ std::string resolve_role_model(const RoleTable &roles, const Settings &settings,
     return m;
 }
 
+std::string provider_override(const Settings &s, const std::string &role)
+{
+    auto it = s.role_providers.find(role);
+    return (it != s.role_providers.end()) ? it->second : std::string();
+}
+
+std::string resolve_role_provider(const Settings &settings, const std::string &role,
+                                  const char *global_provider)
+{
+    std::string p = provider_override(settings, role);
+    if (p.empty() && global_provider) p = global_provider;
+    return p;
+}
+
 /* The worker's spawn-time --role-tools csv AFTER applying the GLOBAL System Tools toggle (settings.system_tools;
  * a missing entry => ON). Start from the role's set (its explicit list, or ALL tools when the role doesn't
  * restrict), drop any tool the operator globally disabled, and render the csv. "" means "all tools" (today's
@@ -122,7 +136,8 @@ static std::string effective_role_tools_csv(const RoleDef &rd, const Settings &s
 }
 
 std::vector<std::string> role_spawn_args(const RoleTable &roles, const Settings &settings,
-                                         const std::string &role, bool live, const char *global_model)
+                                         const std::string &role, bool live, const char *global_model,
+                                         const char *global_provider)
 {
     std::vector<std::string> extra;
     if (live) {
@@ -130,6 +145,14 @@ std::vector<std::string> role_spawn_args(const RoleTable &roles, const Settings 
         if (!model.empty()) {
             extra.push_back("--model");
             extra.push_back(std::move(model));
+        }
+        /* Provider routing rides argv, like --model and unlike the API key: it is a preference, not a
+         * secret, and argv is the established home for non-secret per-role identity here. An unassigned
+         * role emits nothing and spawns exactly as before. */
+        std::string provider = resolve_role_provider(settings, role, global_provider);
+        if (!provider.empty()) {
+            extra.push_back("--provider");
+            extra.push_back(std::move(provider));
         }
     }
     if (!role.empty()) {
@@ -233,7 +256,8 @@ bool Fleet::add_worker(const WorkerDef &def)
         {
             std::unique_lock<std::mutex> rlk;
             if (p_->roles_mu) rlk = std::unique_lock<std::mutex>(*p_->roles_mu);
-            extra = role_spawn_args(*p_->roles, *p_->settings, def.role, p_->env.live, p_->env.model);
+            extra = role_spawn_args(*p_->roles, *p_->settings, def.role, p_->env.live, p_->env.model,
+                                    getenv("HC_OPENROUTER_PROVIDER"));
         }
         args = agent_args(def.id, p_->env.live, p_->env.shared_workspace, p_->env.ws_root, p_->env.sessions_root,
                           p_->env.skills_dir, p_->env.skills_catalog, p_->llm_args, std::move(extra));

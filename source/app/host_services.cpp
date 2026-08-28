@@ -16,6 +16,7 @@
 #include "hc_agent.h"        /* hc_agent_hosted_backend — the chat backend for consolidation */
 #include "hc_conductor.hpp"  /* Conductor P5: ConductorView for fill_conductor + say() routing */
 #include "hc_http.h"
+#include "hc_json.h" /* wrap_provider_json — build the provider block as a tree, never by concatenation */
 #include "hc_llm.h"
 #include "hc_orch_model.hpp"
 #include "hc_orchestrator.hpp"
@@ -307,6 +308,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         std::vector<std::string> preserved_egress = settings->settings.egress_allow;
         std::vector<std::string> preserved_exec = settings->settings.exec_allow; /* W4: live-owned by EditExecAllowlist */
         auto                     preserved_roles = settings->settings.role_models; /* W2: live-owned by AssignRoleModel */
+        auto preserved_role_providers = settings->settings.role_providers; /* live-owned by AssignRoleProvider */
         /* the audio settings are LIVE-owned by the Music Player panel (its volume slider + the mood/spectrum
          * toggles persist them), NOT the Settings panel — preserve them so an [Apply] here can't reset them. */
         bool preserved_mood = settings->settings.conductor_mood_enabled;
@@ -326,6 +328,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         settings->settings.egress_allow = std::move(preserved_egress);
         settings->settings.exec_allow = std::move(preserved_exec);
         settings->settings.role_models = std::move(preserved_roles);
+        settings->settings.role_providers = std::move(preserved_role_providers);
         settings->settings.conductor_mood_enabled = preserved_mood;
         settings->settings.audio_volume = preserved_vol;
         settings->settings.audio_spectrum = preserved_spec;
@@ -385,6 +388,31 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         if (!ok) return "model assignment save FAILED";
         return c.b.empty() ? ("role '" + c.a + "' uses the global model")
                            : ("role '" + c.a + "' -> " + c.b + " (restart workers to apply)");
+    }
+    case hc::ui::UiCommand::Kind::AssignRoleProvider: {
+        /* Assign (or clear, when b is empty) a role's OpenRouter provider routing, persisted IMMEDIATELY —
+         * live-owned exactly like AssignRoleModel above, so SaveSettings must preserve it (it does).
+         *
+         * REJECT a malformed block here rather than letting settings_validate drop it silently: the whole
+         * point of the setting is that a filter you asked for is actually applied, and the failure mode it
+         * guards against (an unpinned run that looks identical to a pinned one) is exactly what a silent
+         * prune would reintroduce one layer up. */
+        if (!settings || c.a.empty()) return "";
+        if (c.b.empty()) {
+            settings->settings.role_providers.erase(c.a);
+        } else {
+            std::string routing = c.b;
+            if (!settings_normalize_provider_routing(routing))
+                return "provider routing must be a JSON object, e.g. {\"quantizations\":[\"fp8\"]} — not applied";
+            settings->settings.role_providers[c.a] = std::move(routing);
+        }
+        settings_validate(settings->settings);
+        bool ok = settings_save(settings->settings, settings->path.c_str());
+        if (!ok) return "provider assignment save FAILED";
+        /* Restart, not respawn: the conductor and planner clients are built once per session and hc_llm
+         * COPIES the routing block, so an existing client keeps the routing it was born with. */
+        return c.b.empty() ? ("role '" + c.a + "' uses default provider routing (restart to apply)")
+                           : ("role '" + c.a + "' routing set (restart to apply)");
     }
     case hc::ui::UiCommand::Kind::AddWorker: {
         /* W2 P2.3: spawn a worker of role c.a at the next free pool id (auto-assigned). The fleet resolves the
@@ -1269,6 +1297,8 @@ Settings from_ui_settings(const hc::ui::UiSettings &u)
     for (const auto &me : u.models) s.models.push_back({me.id, me.note});
     for (const auto &kv : u.role_models)
         if (!kv.first.empty() && !kv.second.empty()) s.role_models[kv.first] = kv.second;
+    for (const auto &kv : u.role_providers)
+        if (!kv.first.empty() && !kv.second.empty()) s.role_providers[kv.first] = kv.second;
     return s;
 }
 
@@ -1718,6 +1748,7 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     /* models (W2): the settings catalog -> the UI catalog; the role->model map -> the assignment grid (pairs). */
     for (const auto &me : s.models) u.models.push_back({me.id, me.note});
     for (const auto &kv : s.role_models) u.role_models.emplace_back(kv.first, kv.second);
+    for (const auto &kv : s.role_providers) u.role_providers.emplace_back(kv.first, kv.second);
     u.key_present = st.secrets && hc_secrets_has(st.secrets, "OPENROUTER_API_KEY");
     /* keychain availability is a SYNCHRONOUS D-Bus probe -> never call it every render frame (60Hz). Re-probe on
      * a coarse cadence (~ every 2s @60fps) + cache; a mid-session keyring unlock still reflects within the
@@ -1814,7 +1845,54 @@ std::vector<std::string> distinct_capabilities(const Pool &pool)
     return caps;
 }
 
-hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http)
+/* Build `{"provider":<pv>}` by CONSTRUCTING the object, never by pasting text around `pv`.
+ *
+ * The concatenation this replaces (`"{\"provider\":" + pv + "}"`) let the operator's value decide the
+ * request's SHAPE, not just the provider block's contents. Two demonstrated failures, both silent, both
+ * reproduced against the linked cJSON on 28/8/2026:
+ *   - pv = `{"quantizations":["fp8"]},"model":"evil"` produced a well-formed TWO-key object, so `model`
+ *     landed a second time on the request ROOT, after the real one. Last-key-wins: the turn ran a model
+ *     the operator never configured, and nothing errored. `"stream":false` would have broken the SSE
+ *     decoder the same way.
+ *   - pv with anything after the closing brace failed the parse of the CONCATENATED string, so
+ *     hc_llm dropped the block entirely (by design, hc_llm.h:63) and the request went out free-routed --
+ *     indistinguishable from a working pin, which is precisely the failure the knob exists to prevent.
+ * Parsing `pv` alone cannot catch either: cJSON accepts trailing content after the root value, so
+ * `{"a":1} JUNK` is "a valid object" to any parse-and-check gate. Re-emitting from the PARSED TREE is
+ * what discards the tail, and owning the root is what guarantees exactly one top-level key.
+ *
+ * Returns "" if `pv` is not a JSON object, having said so on stderr: a rejected filter must be loud,
+ * because a silently-unpinned run looks exactly like a pinned one until the bill arrives. */
+static std::string wrap_provider_json(const char *pv)
+{
+    if (!pv || !*pv) return {};
+    hc_json *inner = hc_json_parse(pv, std::strlen(pv));
+    if (!inner || !hc_json_is_object(inner)) {
+        if (inner) hc_json_free(inner);
+        std::fprintf(stderr, "host: HC_OPENROUTER_PROVIDER is not a JSON object -- ignoring it, "
+                             "this run uses default provider routing\n");
+        return {};
+    }
+    hc_json *root = hc_json_new_object();
+    if (!root) {
+        hc_json_free(inner);
+        return {};
+    }
+    /* obj_set ADOPTS on success and FREES `inner` on failure (hc_json.h:19-21, hc_json.c:146,151), so
+     * the failure path must release only the parent -- freeing the child here would double-free it. */
+    if (!hc_json_obj_set(root, "provider", inner)) {
+        hc_json_free(root); /* do NOT free `inner` again */
+        return {};
+    }
+    char       *text = hc_json_print_canonical(root);
+    std::string out = text ? text : "";
+    free(text);
+    hc_json_free(root); /* frees the adopted `inner` too */
+    return out;
+}
+
+hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http,
+                      const char *provider_json)
 {
     *out_http = nullptr;
     if (!model || !*model || !key || !*key) return nullptr;
@@ -1855,6 +1933,22 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
      * completion token spent on reasoning and none on output, so this is the lever that attacks the cause
      * rather than the symptom. */
     p.reasoning_effort = std::getenv("HC_REASONING_EFFORT");
+    /* OpenRouter provider routing, verbatim JSON for the `provider` block. Unset = today's
+     * behaviour (OpenRouter picks). This exists because endpoint choice is NOT cosmetic: measured
+     * 27/8/2026, deepseek-v4-flash-0731 completed 3/5 forty-deep tool chains on DeepInfra's fp8 and
+     * 0/5 on OpenInference's fp4 -- five straight transport failures -- and an unpinned slug landed
+     * on a third endpoint again (AkashML). Prefer a QUANTISATION filter over pinning one provider:
+     * `{"quantizations":["fp8","bf16","fp16"]}` excludes 4-bit for every model while keeping
+     * fallbacks, whereas `{"only":["DeepInfra"]}` would break any role whose model it does not host.
+     * `provider_json` is the caller's PER-ROLE block (resolve_role_provider); the env var is the global
+     * fallback, so an unset argument reproduces the previous behaviour exactly.
+     * NOT `static`: hc_llm_new COPIES extra_body_json (hc_llm.h:62), so this only has to outlive the
+     * call, and a function-local static WOULD be a bug now that two roles can want different routing --
+     * the second call would rewrite the first client's source buffer. `extra_headers` above is the
+     * opposite -- borrowed, so `hdrs` must stay static. */
+    const char *pv = (provider_json && *provider_json) ? provider_json : std::getenv("HC_OPENROUTER_PROVIDER");
+    std::string provider_body = wrap_provider_json(pv);
+    if (!provider_body.empty()) p.extra_body_json = provider_body.c_str();
     hc_llm *llm = hc_llm_new(&p, http);
     if (!llm) {
         hc_http_free(http);

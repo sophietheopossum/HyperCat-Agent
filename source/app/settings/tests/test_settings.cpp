@@ -51,6 +51,7 @@ static void test_round_trip()
     s.exec_allow = {"/usr/bin/git", "/bin/sh"};
     s.models = {{"google/gemini-3.5-flash", "fast/cheap"}, {"anthropic/claude", "best for code"}};
     s.role_models = {{"dev", "anthropic/claude"}, {"research", "google/gemini-3.5-flash"}};
+    s.role_providers = {{"planner", "{\"quantizations\":[\"fp8\"]}"}, {"conductor", "{\"sort\":\"throughput\"}"}};
     /* automation (B3/B4): the persistence layer is FAITHFUL — both round-trip as set. The session-scoped disarm of
      * allow_all_approvals is a SEPARATE host-load step (settings_clear_session_arming), proven in test_session_arming. */
     s.auto_approve_contained = true;
@@ -115,6 +116,46 @@ static void test_round_trip()
         settings_validate(v);
         CHECK(v.models.size() == 1 && v.models[0].id == "m1");
         CHECK(v.role_models.size() == 1 && v.role_models.count("dev") == 1 && v.role_models.count("qa") == 0);
+    }
+
+    /* per-role provider routing: the sparse map round-trips, canonicalised (as a NESTED object on disk). */
+    CHECK(r.role_providers.size() == 2 && r.role_providers["planner"] == "{\"quantizations\":[\"fp8\"]}" &&
+          r.role_providers["conductor"] == "{\"sort\":\"throughput\"}");
+
+    { /* normalize: an object is canonicalised in place; a non-object is REFUSED and left untouched. */
+        std::string ok = "{ \"sort\" : \"price\" , \"only\" : [\"X\"] }";
+        CHECK(settings_normalize_provider_routing(ok));
+        CHECK(ok == "{\"only\":[\"X\"],\"sort\":\"price\"}"); /* sorted keys, compact */
+        std::string arr = "[1,2]", scalar = "7", junk = "not json", empty_obj = "{}";
+        CHECK(!settings_normalize_provider_routing(arr) && arr == "[1,2]");
+        CHECK(!settings_normalize_provider_routing(scalar) && !settings_normalize_provider_routing(junk));
+        CHECK(!settings_normalize_provider_routing(empty_obj)); /* "{}" is a no-op block -> "no preference" */
+        std::string big = "{\"only\":[\"" + std::string(kMaxProviderRoutingBytes, 'p') + "\"]}";
+        CHECK(!settings_normalize_provider_routing(big)); /* over the per-block cap */
+    }
+
+    { /* THE INJECTION REGRESSION. cJSON accepts trailing content after the root value, so a bare
+       * parse-and-check gate passes this. Re-emitting from the parsed tree is what drops the tail — assert
+       * on the STORED TEXT, because the failure this guards is an injected key reaching the request root. */
+        std::string evil = "{\"quantizations\":[\"fp8\"]},\"model\":\"evil\"";
+        CHECK(settings_normalize_provider_routing(evil));
+        CHECK(evil == "{\"quantizations\":[\"fp8\"]}");
+        CHECK(evil.find("model") == std::string::npos && evil.find("evil") == std::string::npos);
+        std::string tail = "{\"sort\":\"price\"} JUNK";
+        CHECK(settings_normalize_provider_routing(tail) && tail == "{\"sort\":\"price\"}");
+    }
+
+    { /* validate is STRUCTURAL for providers, never referential — pins the deliberate asymmetry with
+       * role_models above. A role in NEITHER the catalog nor role_models keeps its routing; a malformed
+       * block is dropped; and validate is idempotent over a valid one. */
+        Settings v;
+        v.role_providers = {{"nobody", "{ \"sort\":\"price\" }"}, {"bad", "[1]"}, {"", "{\"a\":1}"}};
+        settings_validate(v);
+        CHECK(v.role_providers.size() == 1 && v.role_providers.count("nobody") == 1);
+        CHECK(v.role_providers["nobody"] == "{\"sort\":\"price\"}"); /* canonicalised in place */
+        const auto once = v.role_providers;
+        settings_validate(v);
+        CHECK(v.role_providers == once); /* idempotent */
     }
 
     std::remove(path.c_str());

@@ -84,6 +84,7 @@ int main(int argc, char **argv)
     }
 
     const char *model = opt(argc, argv, "--model");
+    const char *provider = opt(argc, argv, "--provider"); /* per-role OpenRouter routing (not a secret) */
     const char *base_url = opt(argc, argv, "--base-url");
     const char *controller = opt(argc, argv, "--controller");
     const char *workspace = opt(argc, argv, "--workspace");
@@ -111,6 +112,7 @@ int main(int argc, char **argv)
     cfg.exec_enabled = has_flag(argc, argv, "--exec-enabled"); /* W4.3: register the run tool (host-gated) */
     if (model) cfg.model = model;
     if (base_url) cfg.base_url = base_url;
+    if (provider) cfg.provider = provider;
     if (workspace) cfg.workspace = workspace;
     if (sessions) cfg.sessions = sessions;
     cfg.egress_allow = opt_all(argc, argv, "--egress-allow"); /* WI-2 E0: repeatable LAN re-permits */

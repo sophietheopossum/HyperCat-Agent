@@ -345,7 +345,16 @@ ConductorWiring build_conductor(bool live, const char *model, hcapp::Fleet *flee
 {
     ConductorWiring w;
     if (!live) return w;
-    w.llm = open_chat_llm(getenv("HC_BASE_URL"), model, getenv("OPENROUTER_API_KEY"), &w.http);
+    /* The conductor's own provider routing. Resolved here rather than threaded in: this function already
+     * takes SettingsState, and resolve_role_provider needs nothing else — no RoleTable, since "conductor"
+     * is not a RoleTable entry. An unassigned conductor falls back to HC_OPENROUTER_PROVIDER, and with
+     * that unset routes freely, which is what it did before this existed. */
+    const std::string conductor_provider =
+        settings ? hcapp::resolve_role_provider(settings->settings, "conductor",
+                                                getenv("HC_OPENROUTER_PROVIDER"))
+                 : std::string();
+    w.llm = open_chat_llm(getenv("HC_BASE_URL"), model, getenv("OPENROUTER_API_KEY"), &w.http,
+                          conductor_provider.c_str());
     if (!w.llm) return w;
 
     /* W6 P6.3: the project's skills/ dir (empty for an ephemeral/no-data run -> the skill tools no-op). */

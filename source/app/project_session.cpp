@@ -200,8 +200,11 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
     if (s->info_.live) {
         std::string planner_model =
             resolve_role_model(role_state->table, settings->settings, "planner", s->info_.model);
-        s->planner_llm_ = open_chat_llm(getenv("HC_BASE_URL"), planner_model.c_str(),
-                                        getenv("OPENROUTER_API_KEY"), &s->planner_http_);
+        std::string planner_provider =
+            resolve_role_provider(settings->settings, "planner", getenv("HC_OPENROUTER_PROVIDER"));
+        s->planner_llm_ =
+            open_chat_llm(getenv("HC_BASE_URL"), planner_model.c_str(), getenv("OPENROUTER_API_KEY"),
+                          &s->planner_http_, planner_provider.c_str());
         if (s->planner_llm_) {
             hc_llm *pl = s->planner_llm_;
             Fleet  *fl = s->fleet_.get();

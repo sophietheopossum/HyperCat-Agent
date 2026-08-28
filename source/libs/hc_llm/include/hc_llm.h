@@ -53,6 +53,19 @@ typedef struct {
     const char *probe_port;        /* port for hc_llm_probe, or NULL (defaults "443")   */
     const char *const *extra_headers; /* NULL-terminated; borrowed, must outlive hc_llm */
     const char *reasoning_effort;     /* one of the levels in hc_llm.c; NULL/"" = omit (the default)     */
+    /* Extra top-level JSON merged verbatim into every request body. NULL/"" = omit, which is what
+     * every hosted caller uses -- this exists for provider-specific routing the OpenAI schema has no
+     * field for. The concrete need: OpenRouter pins an endpoint with
+     * {"provider":{"only":["DeepInfra"],"allow_fallbacks":false}}, and without it a benchmark
+     * comparing quantisations silently measures whichever endpoint the router happened to pick.
+     * Must be a JSON OBJECT. Only the object itself is used: the value is re-emitted from the parsed
+     * tree, so anything after its closing brace is discarded rather than pasted into the body.
+     * Its keys are merged onto the request root and override nothing we set: an object carrying any of
+     * model, messages, stream, stream_options, tools or reasoning_effort is REFUSED WHOLE and the
+     * request is built without it, because merged keys land last and would otherwise win.
+     * COPIED by hc_llm_new, so the caller's buffer need not outlive the client (unlike extra_headers).
+     * Invalid JSON is dropped and the request is built without it -- never failed outright. */
+    const char *extra_body_json;
 } hc_llm_provider;
 
 typedef struct {

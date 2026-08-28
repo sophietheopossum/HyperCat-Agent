@@ -20,6 +20,7 @@
 
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <utility>
 
@@ -29,6 +30,32 @@ namespace {
 constexpr size_t kMaxSettingsBytes = 256u * 1024u; /* a settings file is tiny; bound a planted/huge file */
 
 int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* Canonicalise one provider-routing block, or report it unusable. Implementation of
+ * settings_normalize_provider_routing — see the header for why the re-emit is load-bearing. */
+bool normalize_routing(std::string &json)
+{
+    if (json.empty()) return false;
+    hc_json *v = hc_json_parse(json.c_str(), json.size());
+    if (!v) return false;
+    if (!hc_json_is_object(v)) {
+        hc_json_free(v);
+        return false;
+    }
+    char *text = hc_json_print_canonical(v);
+    hc_json_free(v);
+    if (!text) return false;
+    const size_t n = std::strlen(text);
+    /* "{}" is a legal object but an empty routing block would splice a no-op key onto every request; treat
+     * it as "no preference" so clearing a field in the UI behaves like clearing an assignment. */
+    if (n <= 2 || n > kMaxProviderRoutingBytes) {
+        free(text);
+        return false;
+    }
+    json.assign(text, n);
+    free(text);
+    return true;
+}
 
 /* Split a comma-separated list into trimmed, non-empty, capped entries (HC_EGRESS_ALLOW). Local copy of
  * the policy parser's logic — this module deliberately does not depend on hc_policy. */
@@ -65,6 +92,8 @@ bool env_int(const char *name, int *out)
 }
 
 } // namespace
+
+bool settings_normalize_provider_routing(std::string &json) { return normalize_routing(json); }
 
 bool settings_parse(const char *json, size_t len, Settings &out)
 {
@@ -154,12 +183,32 @@ bool settings_parse(const char *json, size_t len, Settings &out)
         if (const hc_json *assign = hc_json_get(m, "assign"); assign && hc_json_is_array(assign)) {
             out.role_models.clear();
             const size_t n = hc_json_arr_len(assign);
-            for (size_t i = 0; i < n; i++) {
+            for (size_t i = 0; i < n && out.role_models.size() < kMaxModels; i++) {
                 const hc_json *e = hc_json_arr_at(assign, i);
                 if (!e) continue;
                 std::string role = hc_json_get_str(e, "role", "");
                 std::string mid = hc_json_get_str(e, "model", "");
                 if (!role.empty() && !mid.empty()) out.role_models[role] = mid;
+            }
+        }
+        /* `provider` is a nested OBJECT, not an escaped string, so settings.json stays hand-editable. It is
+         * stored in canonical text form; normalize_routing both validates and canonicalises, so a block that
+         * survives here is exactly what will be spliced onto the request. */
+        if (const hc_json *provs = hc_json_get(m, "providers"); provs && hc_json_is_array(provs)) {
+            out.role_providers.clear();
+            const size_t n = hc_json_arr_len(provs);
+            for (size_t i = 0; i < n && out.role_providers.size() < kMaxRoleProviders; i++) {
+                const hc_json *e = hc_json_arr_at(provs, i);
+                if (!e) continue;
+                std::string role = hc_json_get_str(e, "role", "");
+                if (role.empty()) continue;
+                const hc_json *blk = hc_json_get(e, "provider");
+                if (!blk || !hc_json_is_object(blk)) continue;
+                char *text = hc_json_print_canonical(blk);
+                if (!text) continue;
+                std::string routing(text);
+                free(text);
+                if (normalize_routing(routing)) out.role_providers[role] = std::move(routing);
             }
         }
     }
@@ -290,6 +339,23 @@ std::string settings_serialize(const Settings &s)
                 hc_json_arr_append(assign, e); /* adopts */
             }
             hc_json_obj_set(m, "assign", assign); /* adopts */
+        }
+        if (hc_json *provs = hc_json_new_array()) {
+            for (const auto &kv : s.role_providers) {
+                /* Re-parse the stored canonical text into a nested object so the file stays readable and
+                 * hand-editable. Cannot fail post-validate; skip defensively rather than emit a broken entry. */
+                hc_json *blk = hc_json_parse(kv.second.c_str(), kv.second.size());
+                if (!blk) continue;
+                hc_json *e = hc_json_new_object();
+                if (!e) {
+                    hc_json_free(blk);
+                    continue;
+                }
+                hc_json_obj_set_str(e, "role", kv.first.c_str());
+                hc_json_obj_set(e, "provider", blk); /* adopts */
+                hc_json_arr_append(provs, e);        /* adopts */
+            }
+            hc_json_obj_set(m, "providers", provs); /* adopts */
         }
         hc_json_obj_set(root, "models", m); /* adopts */
     }
@@ -434,6 +500,20 @@ void settings_validate(Settings &s)
     for (auto it = s.role_models.begin(); it != s.role_models.end();) {
         if (it->second.empty() || !in_catalog(it->second)) it = s.role_models.erase(it);
         else ++it;
+    }
+
+    /* Per-role provider routing: a STRUCTURAL check only (parses as an object, canonical form within the
+     * cap), never a referential one. Deliberate — see the role_providers comment in the header: there is no
+     * provider catalog to be consistent WITH, so an in_catalog-shaped rule here would erase every
+     * assignment. normalize_routing canonicalises in place, which keeps this idempotent. */
+    size_t kept_providers = 0;
+    for (auto it = s.role_providers.begin(); it != s.role_providers.end();) {
+        if (it->first.empty() || kept_providers >= kMaxRoleProviders || !normalize_routing(it->second)) {
+            it = s.role_providers.erase(it);
+        } else {
+            ++kept_providers;
+            ++it;
+        }
     }
 }
 

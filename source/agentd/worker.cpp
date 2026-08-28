@@ -433,6 +433,41 @@ constexpr int kLlmCallTotalMs = 120000; /* per streamed LLM call: a generous wal
                                          * (kTaskDeadlineMs) is kept above this. */
 constexpr int kLlmConnectMs = 10000;    /* TCP/TLS connect timeout for an LLM call */
 
+/* Build `{"provider":<inner>}` by CONSTRUCTING the object, never by pasting text around it. Mirrors
+ * wrap_provider_json in app/host_services.cpp deliberately — the two are 15 lines and duplicating them
+ * beats putting an app-policy helper into a shared library for two callers. The reason it must not be a
+ * concatenation: cJSON accepts trailing content after the root value, so a parse-and-check gate passes
+ * `{"a":1} JUNK`, and pasting the raw text lets the value add SIBLING keys to the request root — an
+ * injected "model" or "stream" would land after ours and win under last-key-wins. Owning the root is what
+ * guarantees exactly one top-level key; re-emitting from the tree is what discards the tail. */
+std::string wrap_provider_json(const std::string &inner)
+{
+    if (inner.empty()) return {};
+    hc_json *parsed = hc_json_parse(inner.c_str(), inner.size());
+    if (!parsed || !hc_json_is_object(parsed)) {
+        if (parsed) hc_json_free(parsed);
+        std::fprintf(stderr, "worker: --provider is not a JSON object -- ignoring it, this worker uses "
+                             "default provider routing\n");
+        return {};
+    }
+    hc_json *root = hc_json_new_object();
+    if (!root) {
+        hc_json_free(parsed);
+        return {};
+    }
+    /* obj_set ADOPTS on success and FREES `parsed` on failure (hc_json.h:19-21), so the failure path
+     * releases only the parent -- freeing the child here would double-free it. */
+    if (!hc_json_obj_set(root, "provider", parsed)) {
+        hc_json_free(root); /* do NOT free `parsed` again */
+        return {};
+    }
+    char       *text = hc_json_print_canonical(root);
+    std::string out = text ? text : "";
+    free(text);
+    hc_json_free(root); /* frees the adopted child too */
+    return out;
+}
+
 ::hc_llm *build_llm(const WorkerConfig &cfg, hc_http **http, bool *http_inited)
 {
     *http = nullptr;
@@ -460,6 +495,10 @@ constexpr int kLlmConnectMs = 10000;    /* TCP/TLS connect timeout for an LLM ca
     /* Cap how long a reasoning model thinks. Unset = the model's own default, which on a large prompt can
      * consume the entire wall-clock budget in reasoning tokens and be cancelled before it answers. */
     pcfg.reasoning_effort = std::getenv("HC_REASONING_EFFORT");
+    /* Per-role provider routing, resolved host-side and passed as --provider. Empty => free routing (what
+     * every worker did before this existed). hc_llm COPIES extra_body_json, so this local outlives its use. */
+    const std::string provider_body = wrap_provider_json(cfg.provider);
+    if (!provider_body.empty()) pcfg.extra_body_json = provider_body.c_str();
     *http = h;
     return hc_llm_new(&pcfg, h);
 }

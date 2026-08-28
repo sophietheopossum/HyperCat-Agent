@@ -238,6 +238,9 @@ struct UiSettings {
      * `model` above stays the global/fallback; both empty => today's single-model behaviour. */
     std::vector<UiModelEntry>                        models;      /* the operator's catalog ({id,note}) */
     std::vector<std::pair<std::string, std::string>> role_models; /* role -> model id (the assignment grid) */
+    /* role -> the OpenRouter provider-routing block (inner object, canonical JSON), for the same grid. An
+     * absent role means "inherit HC_OPENROUTER_PROVIDER", which unset means free routing. */
+    std::vector<std::pair<std::string, std::string>> role_providers;
     /* env-override locks — a set env var WINS over the file; the field renders disabled with a note */
     bool ov_model = false, ov_base_url = false, ov_embed_model = false, ov_reasoning_effort = false,
          ov_data_dir = false,
@@ -491,6 +494,9 @@ struct UiCommand {
         ConductorDeleteChat, /* a: session id — delete a conversation (P3b; the ACTIVE one is refused, confirm-gated) */
         AssignRoleModel, /* a: role, b: model id ("" clears -> the role inherits the global model). The host
                           * updates role_models live + persists immediately (W2; mirrors EditAllowlist). */
+        AssignRoleProvider, /* a: role, b: the OpenRouter routing block as an INNER JSON object ("" clears ->
+                             * the role inherits HC_OPENROUTER_PROVIDER). Live-persisted like AssignRoleModel;
+                             * the host REJECTS a non-object with a notice rather than dropping it silently. */
         AddWorker,       /* a: role — spawn a new worker of that role at the next free id (W2 P2.3)          */
         RemoveWorker,    /* a: worker id — reap it + revoke its bus routing, drop it from the fleet (W2 P2.3) */
         EditRole,        /* role_edit: the edited role TEMPLATE — host UPSERTS into the role table, validates +

@@ -291,15 +291,53 @@ int main(int argc, char **argv)
     /* Pin one endpoint. Without this a run measures whichever the router picked -- verified 27/8:
      * a bare slug for deepseek-v4-flash-0731 landed on AkashML, not even the cheapest of its 29
      * endpoints. Comparing quantisations demands a pin, and allow_fallbacks:false makes a wrong
-     * pin fail loudly rather than silently routing elsewhere and reading like a null result. */
-    char provider_json[256] = {0};
+     * pin fail loudly rather than silently routing elsewhere and reading like a null result.
+     *
+     * BUILT AS A TREE, not by snprintf'ing the name into a JSON template. `provider` is argv, so a
+     * name containing a quote used to decide the request's SHAPE rather than just its contents: with
+     * `--provider 'X"]},"model":"evil'` the %s closed the array and object early and pasted a second
+     * `model` key onto the request root, where last-key-wins made it the model actually run. hc_llm now
+     * refuses a block carrying a reserved key, so that no longer redirects a turn -- but it fails by
+     * dropping the pin ENTIRELY, which for this tool is the worst outcome available: an unpinned run
+     * silently measures whichever endpoint the router chose, which is the exact null result the pin
+     * exists to prevent. Constructing the node escapes the name instead, so a weird name stays a name. */
+    char *provider_json = NULL;
     if (provider && provider[0]) {
-        snprintf(provider_json, sizeof provider_json,
-                 "{\"provider\":{\"only\":[\"%s\"],\"allow_fallbacks\":false}}", provider);
-        cfg.extra_body_json = provider_json;
+        hc_json *root = hc_json_new_object();
+        hc_json *blk = hc_json_new_object();
+        hc_json *only = hc_json_new_array();
+        if (!root || !blk || !only || !hc_json_arr_append_str(only, provider)) {
+            hc_json_free(root);
+            hc_json_free(blk);
+            hc_json_free(only);
+            fprintf(stderr, "could not build the provider block for '%s'\n", provider);
+            return 1;
+        }
+        /* obj_set/arr_append ADOPT on success and FREE the child on failure -- so a failed add must not
+         * free its child again, but DOES leave the parent still ours to release. Split from the
+         * `provider` add below for exactly that reason: there, `blk` is the child. */
+        if (!hc_json_obj_set(blk, "only", only) || !hc_json_obj_set_bool(blk, "allow_fallbacks", false)) {
+            hc_json_free(blk); /* `only` was freed by the failed add; blk is still ours */
+            hc_json_free(root);
+            fprintf(stderr, "could not build the provider block for '%s'\n", provider);
+            return 1;
+        }
+        if (!hc_json_obj_set(root, "provider", blk)) { /* frees blk on failure */
+            hc_json_free(root);
+            fprintf(stderr, "could not build the provider block for '%s'\n", provider);
+            return 1;
+        }
+        provider_json = hc_json_print_canonical(root);
+        hc_json_free(root);
+        if (!provider_json) {
+            fprintf(stderr, "could not serialize the provider block\n");
+            return 1;
+        }
+        cfg.extra_body_json = provider_json; /* COPIED by hc_llm_new; freed below */
     }
 
     hc_llm *llm = hc_llm_new(&cfg, http);
+    free(provider_json); /* hc_llm took its own copy */
     if (!llm) { fprintf(stderr, "hc_llm_new failed\n"); return 1; }
 
     int grand_calls = 0, grand_valid = 0, completed = 0;

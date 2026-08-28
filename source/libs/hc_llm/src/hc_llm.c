@@ -98,6 +98,25 @@ char *hc_llm_build_request_json_ex2(const char *model, const hc_llm_message *msg
         if (add) hc_json_free(add);
         return base;
     }
+
+    /* The extra's keys are appended AFTER ours, so any key we also set would WIN under last-key-wins.
+     * Refuse the whole block rather than emit a body whose model/messages/stream are not the ones the
+     * caller asked for -- `"model"` silently redirects the turn to another model, `"stream":false`
+     * starves the SSE decoder, `"messages"` substitutes the prompt. Rejecting wholesale (rather than
+     * dropping the offending key) keeps the rule one line to state and impossible to half-apply.
+     *
+     * By NAME, not by iteration: hc_json exposes no key enumerator, and this is the complete set
+     * hc_llm_build_request_json_ex can set -- checked against it, not against the base text, so a
+     * conditionally-absent key (tools, reasoning_effort) is still reserved. Keep the two in step. */
+    static const char *const kReserved[] = {"model",  "messages", "stream",
+                                            "tools",  "stream_options", "reasoning_effort"};
+    for (size_t i = 0; i < sizeof kReserved / sizeof *kReserved; i++) {
+        if (hc_json_get(add, kReserved[i])) {
+            hc_json_free(add);
+            return base;
+        }
+    }
+
     char *canon = hc_json_print_canonical(add);
     hc_json_free(add);
     if (!canon) return base;

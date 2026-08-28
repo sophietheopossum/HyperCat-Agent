@@ -16,6 +16,7 @@
 #include "hc_agent.h"        /* hc_agent_hosted_backend — the chat backend for consolidation */
 #include "hc_conductor.hpp"  /* Conductor P5: ConductorView for fill_conductor + say() routing */
 #include "hc_http.h"
+#include "hc_json.h" /* wrap_provider_json — build the provider block as a tree, never by concatenation */
 #include "hc_llm.h"
 #include "hc_orch_model.hpp"
 #include "hc_orchestrator.hpp"
@@ -1812,6 +1813,51 @@ std::vector<std::string> distinct_capabilities(const Pool &pool)
     return caps;
 }
 
+/* Build `{"provider":<pv>}` by CONSTRUCTING the object, never by pasting text around `pv`.
+ *
+ * The concatenation this replaces (`"{\"provider\":" + pv + "}"`) let the operator's value decide the
+ * request's SHAPE, not just the provider block's contents. Two demonstrated failures, both silent, both
+ * reproduced against the linked cJSON on 28/8/2026:
+ *   - pv = `{"quantizations":["fp8"]},"model":"evil"` produced a well-formed TWO-key object, so `model`
+ *     landed a second time on the request ROOT, after the real one. Last-key-wins: the turn ran a model
+ *     the operator never configured, and nothing errored. `"stream":false` would have broken the SSE
+ *     decoder the same way.
+ *   - pv with anything after the closing brace failed the parse of the CONCATENATED string, so
+ *     hc_llm dropped the block entirely (by design, hc_llm.h:63) and the request went out free-routed --
+ *     indistinguishable from a working pin, which is precisely the failure the knob exists to prevent.
+ * Parsing `pv` alone cannot catch either: cJSON accepts trailing content after the root value, so
+ * `{"a":1} JUNK` is "a valid object" to any parse-and-check gate. Re-emitting from the PARSED TREE is
+ * what discards the tail, and owning the root is what guarantees exactly one top-level key.
+ *
+ * Returns "" if `pv` is not a JSON object, having said so on stderr: a rejected filter must be loud,
+ * because a silently-unpinned run looks exactly like a pinned one until the bill arrives. */
+static std::string wrap_provider_json(const char *pv)
+{
+    if (!pv || !*pv) return {};
+    hc_json *inner = hc_json_parse(pv, std::strlen(pv));
+    if (!inner || !hc_json_is_object(inner)) {
+        if (inner) hc_json_free(inner);
+        std::fprintf(stderr, "host: HC_OPENROUTER_PROVIDER is not a JSON object -- ignoring it, "
+                             "this run uses default provider routing\n");
+        return {};
+    }
+    hc_json *root = hc_json_new_object();
+    if (!root) {
+        hc_json_free(inner);
+        return {};
+    }
+    if (!hc_json_obj_set(root, "provider", inner)) { /* adopts `inner` on success only */
+        hc_json_free(inner);
+        hc_json_free(root);
+        return {};
+    }
+    char       *text = hc_json_print_canonical(root);
+    std::string out = text ? text : "";
+    free(text);
+    hc_json_free(root); /* frees the adopted `inner` too */
+    return out;
+}
+
 hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http)
 {
     *out_http = nullptr;
@@ -1841,12 +1887,12 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
      * on a third endpoint again (AkashML). Prefer a QUANTISATION filter over pinning one provider:
      * `{"quantizations":["fp8","bf16","fp16"]}` excludes 4-bit for every model while keeping
      * fallbacks, whereas `{"only":["DeepInfra"]}` would break any role whose model it does not host.
-     * Applies to the conductor and planner alike -- the two roles that share this factory. */
-    static std::string provider_body;
-    if (const char *pv = std::getenv("HC_OPENROUTER_PROVIDER"); pv && *pv) {
-        provider_body = std::string("{\"provider\":") + pv + "}";
-        p.extra_body_json = provider_body.c_str();
-    }
+     * Applies to the conductor and planner alike -- the two roles that share this factory.
+     * NOT `static`: hc_llm_new COPIES extra_body_json (hc_llm.h:62), so this only has to outlive the
+     * call, and a function-local static would be a data race the moment two roles want different
+     * routing. `extra_headers` above is the opposite -- borrowed, so `hdrs` must stay static. */
+    std::string provider_body = wrap_provider_json(std::getenv("HC_OPENROUTER_PROVIDER"));
+    if (!provider_body.empty()) p.extra_body_json = provider_body.c_str();
     hc_llm *llm = hc_llm_new(&p, http);
     if (!llm) {
         hc_http_free(http);

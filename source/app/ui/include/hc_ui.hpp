@@ -232,6 +232,7 @@ struct UiSettings {
     bool                     notify_available = false;   /* this BUILD can notify (gio present; Linux)   */
     /* automation (B3/B4) — delegated-approval opt-ins; BOTH default OFF, the human gate stays the floor */
     bool                     auto_approve_contained = false; /* auto-approve sandbox-contained writes only */
+    bool                     auto_approve_readonly_egress = false; /* auto-approve read-only egress tools (B3b) */
     bool                     allow_all_approvals = false;    /* auto-approve EVERYTHING (armed via consent modal) */
     /* models (Worker Revamp W2) — the available-models catalog + the per-role assignment, for the Models panel.
      * `model` above stays the global/fallback; both empty => today's single-model behaviour. */

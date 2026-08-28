@@ -404,6 +404,16 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
                           "they're sandbox-contained + recorded as artifacts. Exec, shared-memory writes, and "
                           "anything new ALWAYS come to you. It never auto-denies. Default off.");
 
+    /* B3b: the read-only-egress class — tools that can reach the network but cannot write files or run binaries. */
+    ImGui::Checkbox("auto-approve read-only web tools (egress, no fs-write, no exec)",
+                    &d.auto_approve_readonly_egress);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("When on, calls to third-party tools whose manifest grants network access but NO file "
+                          "writes and NO exec are approved without a prompt — the worst case is a page fetched "
+                          "you didn't sanction, not a changed machine. A tool that also writes or execs still "
+                          "prompts, as does any function its author marked sensitive. Meant for research runs, "
+                          "where one task is tens of fetches. It never auto-denies. Default off.");
+
     /* B4: the allow-all escape hatch — armed ONLY behind a type-to-confirm consent window, loud while live, and
      * disarmable in one click (arming/disarming is committed immediately, bypassing [Apply], for an unambiguous
      * footgun). */

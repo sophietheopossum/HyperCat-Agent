@@ -81,6 +81,23 @@ struct ToolManifest {
     {
         return fs_mode == ToolFsMode::ReadWrite || !egress_hosts.empty() || !exec_allow.empty();
     }
+
+    /* True if this tool's envelope grants network egress and NOTHING ELSE that can change the machine: no
+     * workspace writes, no exec. Such a tool is still envelope_sensitive() -- it reaches the network, and its
+     * calls still gate by default -- but it is a materially different risk class from one that can write files
+     * or run binaries: the worst case is reading a page the operator did not sanction, not modifying anything.
+     *
+     * This exists so the operator can opt into auto-approving THAT class alone (settings
+     * auto_approve_readonly_egress) instead of being forced to choose between prompting on every single fetch
+     * and arming allow-all, which would also auto-approve exec. A research task is tens of fetches; without
+     * this the only unattended option was the most dangerous switch in the system.
+     *
+     * Deliberately NOT satisfied by fs_mode == ReadOnly: read-only workspace access plus egress is an
+     * exfiltration path, and this predicate must stay boring. */
+    bool envelope_readonly_egress() const
+    {
+        return !egress_hosts.empty() && fs_mode == ToolFsMode::None && exec_allow.empty();
+    }
 };
 
 const char *tool_fs_mode_str(ToolFsMode m);

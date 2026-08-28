@@ -218,6 +218,13 @@ public:
      * EVERY request (run included, still allowlist-re-validated) — the power-user / stress-test escape hatch, gated
      * in the UI behind a type-to-confirm consent window + a loud sticky warning. Thread-safe (atomic). */
     void set_allow_all(bool on);
+    /* B3b: enable/disable auto-approval of READ-ONLY EGRESS third-party tools (the host sets it live from
+     * settings each frame; default OFF), plus the set of function names that qualify. The host derives that set
+     * from manifests IT parsed (ToolManifest::envelope_readonly_egress) -- the gate never trusts a caller's claim
+     * about its own risk, which is why the names arrive from the host rather than riding the authorize body.
+     * An empty set disables the path regardless of the flag. Never auto-denies. Thread-safe. */
+    void set_readonly_egress_auto(bool on);
+    void set_readonly_egress_tools(std::unordered_set<std::string> names);
     /* B3: drain the auto-approved trace (the host records each as an artifact, same provenance as a human approve,
      * and raises a quiet toast). Bounded; clears the buffer. UI thread. */
     void copy_auto_approved(std::vector<AutoApprovedView> &out);
@@ -311,6 +318,11 @@ private:
      * skips the prompt, never the exec floor). Gated in the UI behind a type-to-confirm consent window + a sticky
      * armed warning. Same relaxed-atomic rationale as auto_mode_enabled_. */
     std::atomic<bool>                             allow_all_{false};
+    /* B3b: the read-only-egress auto-approve arm + the host-derived name set it applies to. Guarded by its own
+     * mutex (refreshed on the host's poll tick, read on the bus-reader thread) so it never contends with mu_. */
+    std::atomic<bool>                             readonly_egress_auto_{false};
+    std::mutex                                    readonly_egress_mu_;
+    std::unordered_set<std::string>               readonly_egress_tools_;
     /* B3: the auto-approved trace the host drains each frame (-> artifact record [fs writes] + a quiet toast). Bounded
      * drop-oldest, guarded by mu_; written by the reader, drained by the host. Mirrors the UiAdapter egress ring. */
     std::deque<AutoApprovedView>                  auto_approved_;

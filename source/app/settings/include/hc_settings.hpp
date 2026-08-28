@@ -84,6 +84,12 @@ struct Settings {
      * power-user / stress-test escape hatch that auto-approves EVERYTHING — armed only behind a type-to-confirm
      * consent window and loud while live (B4). Neither is ever injected into a worker's env. */
     bool auto_approve_contained = false;
+    /* B3b: auto-approve calls to third-party tools whose envelope grants egress ONLY (no fs-write, no exec) --
+     * see ToolManifest::envelope_readonly_egress. Default OFF. Persisted like auto_approve_contained rather
+     * than session-scoped like allow_all_approvals: the class is bounded and reversible (a read cannot modify
+     * the machine), the tool is still inside its hc_confine jail, and the operator reviewed its manifest at
+     * install. It never auto-denies, and an explicitly `sensitive` function still prompts. */
+    bool auto_approve_readonly_egress = false;
     bool allow_all_approvals = false;
     /* Post a pending approval as a DESKTOP notification (with Approve/Deny actions), and mark the window
      * as wanting attention. DEFAULT OFF: it reaches outside the application to the user's desktop, which

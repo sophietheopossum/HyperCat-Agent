@@ -497,6 +497,33 @@ void AuthGate::reader_loop()
             continue; /* never enqueued -> the operator never sees a prompt for it */
         }
 
+        /* B3b: the READ-ONLY EGRESS pre-screen. Same shape and the same guarantees as the block above -- opt-in,
+         * default off, buffered so it is visible, and it NEVER auto-denies. The eligible set is host-derived from
+         * manifests granting egress and neither fs-write nor exec, so the worst case of a wrong auto-approval here
+         * is a page fetched that the operator did not sanction, not a modified machine.
+         *
+         * This exists because a research task is tens of fetches: without it the only unattended option was
+         * allow-all, which would also auto-approve exec. Narrowing the blast radius beats arming the big switch. */
+        if (readonly_egress_auto_.load(std::memory_order_relaxed)) {
+            bool eligible = false;
+            {
+                std::lock_guard<std::mutex> rl(readonly_egress_mu_);
+                eligible = readonly_egress_tools_.count(tool) != 0;
+            }
+            if (eligible) {
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    auto_approved_.push_back({m.from, tool, path, content});
+                    while (auto_approved_.size() > kMaxAutoApproved) auto_approved_.pop_front();
+                }
+                std::fprintf(stderr, "host: auto-approved %s from %s (read-only egress tool)\n", tool.c_str(),
+                             m.from.c_str());
+                std::lock_guard<std::mutex> sl(send_mu_);
+                bus_->send_reply(m.from, m.corr, verdict_body(true));
+                continue;
+            }
+        }
+
         std::lock_guard<std::mutex> lk(mu_);
         if (pending_.size() >= kMaxPending) continue; /* flood guard (the fleet size already bounds it) */
         std::string id = "auth-" + std::to_string(next_id_++);
@@ -608,6 +635,15 @@ void AuthGate::dismiss(const std::string &id)
 
 void AuthGate::set_auto_mode(bool on) { auto_mode_enabled_.store(on, std::memory_order_relaxed); }
 void AuthGate::set_allow_all(bool on) { allow_all_.store(on, std::memory_order_relaxed); }
+void AuthGate::set_readonly_egress_auto(bool on)
+{
+    readonly_egress_auto_.store(on, std::memory_order_relaxed);
+}
+void AuthGate::set_readonly_egress_tools(std::unordered_set<std::string> names)
+{
+    std::lock_guard<std::mutex> lk(readonly_egress_mu_);
+    readonly_egress_tools_ = std::move(names);
+}
 
 void AuthGate::copy_auto_approved(std::vector<AutoApprovedView> &out)
 {

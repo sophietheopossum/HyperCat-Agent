@@ -58,6 +58,10 @@ public:
         std::string description; /* from the manifest */
         std::string spec_json;   /* the function spec */
         bool        sensitive = false;
+        /* The package grants egress but no fs-write and no exec, AND this function is not individually flagged
+         * sensitive. The HOST derives this from the manifest it parsed itself -- never from a worker's claim
+         * about its own risk -- and hands the gate the resulting name set. */
+        bool        readonly_egress = false;
         bool        running = false; /* the tool process is launched + token-confirmed */
     };
     std::vector<FnView> functions() const;

@@ -308,6 +308,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         std::vector<std::string> preserved_egress = settings->settings.egress_allow;
         std::vector<std::string> preserved_exec = settings->settings.exec_allow; /* W4: live-owned by EditExecAllowlist */
         auto                     preserved_roles = settings->settings.role_models; /* W2: live-owned by AssignRoleModel */
+        auto preserved_role_providers = settings->settings.role_providers; /* live-owned by AssignRoleProvider */
         /* the audio settings are LIVE-owned by the Music Player panel (its volume slider + the mood/spectrum
          * toggles persist them), NOT the Settings panel — preserve them so an [Apply] here can't reset them. */
         bool preserved_mood = settings->settings.conductor_mood_enabled;
@@ -327,6 +328,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         settings->settings.egress_allow = std::move(preserved_egress);
         settings->settings.exec_allow = std::move(preserved_exec);
         settings->settings.role_models = std::move(preserved_roles);
+        settings->settings.role_providers = std::move(preserved_role_providers);
         settings->settings.conductor_mood_enabled = preserved_mood;
         settings->settings.audio_volume = preserved_vol;
         settings->settings.audio_spectrum = preserved_spec;
@@ -386,6 +388,31 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         if (!ok) return "model assignment save FAILED";
         return c.b.empty() ? ("role '" + c.a + "' uses the global model")
                            : ("role '" + c.a + "' -> " + c.b + " (restart workers to apply)");
+    }
+    case hc::ui::UiCommand::Kind::AssignRoleProvider: {
+        /* Assign (or clear, when b is empty) a role's OpenRouter provider routing, persisted IMMEDIATELY —
+         * live-owned exactly like AssignRoleModel above, so SaveSettings must preserve it (it does).
+         *
+         * REJECT a malformed block here rather than letting settings_validate drop it silently: the whole
+         * point of the setting is that a filter you asked for is actually applied, and the failure mode it
+         * guards against (an unpinned run that looks identical to a pinned one) is exactly what a silent
+         * prune would reintroduce one layer up. */
+        if (!settings || c.a.empty()) return "";
+        if (c.b.empty()) {
+            settings->settings.role_providers.erase(c.a);
+        } else {
+            std::string routing = c.b;
+            if (!settings_normalize_provider_routing(routing))
+                return "provider routing must be a JSON object, e.g. {\"quantizations\":[\"fp8\"]} — not applied";
+            settings->settings.role_providers[c.a] = std::move(routing);
+        }
+        settings_validate(settings->settings);
+        bool ok = settings_save(settings->settings, settings->path.c_str());
+        if (!ok) return "provider assignment save FAILED";
+        /* Restart, not respawn: the conductor and planner clients are built once per session and hc_llm
+         * COPIES the routing block, so an existing client keeps the routing it was born with. */
+        return c.b.empty() ? ("role '" + c.a + "' uses default provider routing (restart to apply)")
+                           : ("role '" + c.a + "' routing set (restart to apply)");
     }
     case hc::ui::UiCommand::Kind::AddWorker: {
         /* W2 P2.3: spawn a worker of role c.a at the next free pool id (auto-assigned). The fleet resolves the
@@ -1269,6 +1296,8 @@ Settings from_ui_settings(const hc::ui::UiSettings &u)
     for (const auto &me : u.models) s.models.push_back({me.id, me.note});
     for (const auto &kv : u.role_models)
         if (!kv.first.empty() && !kv.second.empty()) s.role_models[kv.first] = kv.second;
+    for (const auto &kv : u.role_providers)
+        if (!kv.first.empty() && !kv.second.empty()) s.role_providers[kv.first] = kv.second;
     return s;
 }
 
@@ -1717,6 +1746,7 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     /* models (W2): the settings catalog -> the UI catalog; the role->model map -> the assignment grid (pairs). */
     for (const auto &me : s.models) u.models.push_back({me.id, me.note});
     for (const auto &kv : s.role_models) u.role_models.emplace_back(kv.first, kv.second);
+    for (const auto &kv : s.role_providers) u.role_providers.emplace_back(kv.first, kv.second);
     u.key_present = st.secrets && hc_secrets_has(st.secrets, "OPENROUTER_API_KEY");
     /* keychain availability is a SYNCHRONOUS D-Bus probe -> never call it every render frame (60Hz). Re-probe on
      * a coarse cadence (~ every 2s @60fps) + cache; a mid-session keyring unlock still reflects within the
@@ -1858,7 +1888,8 @@ static std::string wrap_provider_json(const char *pv)
     return out;
 }
 
-hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http)
+hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http,
+                      const char *provider_json)
 {
     *out_http = nullptr;
     if (!model || !*model || !key || !*key) return nullptr;
@@ -1887,11 +1918,14 @@ hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, 
      * on a third endpoint again (AkashML). Prefer a QUANTISATION filter over pinning one provider:
      * `{"quantizations":["fp8","bf16","fp16"]}` excludes 4-bit for every model while keeping
      * fallbacks, whereas `{"only":["DeepInfra"]}` would break any role whose model it does not host.
-     * Applies to the conductor and planner alike -- the two roles that share this factory.
+     * `provider_json` is the caller's PER-ROLE block (resolve_role_provider); the env var is the global
+     * fallback, so an unset argument reproduces the previous behaviour exactly.
      * NOT `static`: hc_llm_new COPIES extra_body_json (hc_llm.h:62), so this only has to outlive the
-     * call, and a function-local static would be a data race the moment two roles want different
-     * routing. `extra_headers` above is the opposite -- borrowed, so `hdrs` must stay static. */
-    std::string provider_body = wrap_provider_json(std::getenv("HC_OPENROUTER_PROVIDER"));
+     * call, and a function-local static WOULD be a bug now that two roles can want different routing --
+     * the second call would rewrite the first client's source buffer. `extra_headers` above is the
+     * opposite -- borrowed, so `hdrs` must stay static. */
+    const char *pv = (provider_json && *provider_json) ? provider_json : std::getenv("HC_OPENROUTER_PROVIDER");
+    std::string provider_body = wrap_provider_json(pv);
     if (!provider_body.empty()) p.extra_body_json = provider_body.c_str();
     hc_llm *llm = hc_llm_new(&p, http);
     if (!llm) {

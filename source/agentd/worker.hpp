@@ -63,6 +63,11 @@ struct WorkerConfig {
      * deterministic offline echo (so the gates stay key-free). base_url defaults to OpenRouter. */
     std::string model;
     std::string base_url;
+    /* The OpenRouter provider-routing block for THIS role (the inner object, canonical JSON), resolved
+     * host-side in role_spawn_args and passed as --provider. Empty => free routing, which is what every
+     * worker did before this existed. A preference, not a secret, so argv is the right channel — the API
+     * key still rides the env and never argv. */
+    std::string provider;
     /* If set, the worker opens an hc_sandbox jailed to this root and registers the human-gated
      * fs_write agent tool (each write blocks on a tool.authorize verdict from the host). Empty (the
      * default) => no filesystem tool, so the key-free gates and a tool-less worker are unaffected. The

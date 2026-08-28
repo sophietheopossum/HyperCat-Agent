@@ -79,11 +79,26 @@ std::string model_override(const Settings &, const std::string &role);
 std::string resolve_role_model(const RoleTable &, const Settings &, const std::string &role,
                                const char *global_model);
 
-/* The per-worker `extra` spawn args carrying spawn-time identity: --model (live, resolved) + --role +
- * --role-prompt (the overlay APPENDED after the base) + --role-tools (the tool-id subset). An empty
- * overlay/csv is OMITTED, so an unconfigured role spawns exactly as the base (base prompt, all tools). */
+/* The operator's per-role PROVIDER-ROUTING override (settings.role_providers), or "" if unassigned. */
+std::string provider_override(const Settings &, const std::string &role);
+
+/* Resolve a role's OpenRouter provider-routing block (the INNER object, canonical JSON): operator
+ * role_providers > `global_provider` (the caller passes HC_OPENROUTER_PROVIDER); "" if neither applies,
+ * which means free routing. TWO tiers, not three: the RoleTable carries no provider, deliberately — the
+ * two roles this exists for (planner, conductor) are not RoleTable entries at all, so a table tier would
+ * be a permanent no-op for exactly the cases that motivated the feature.
+ *
+ * Takes no RoleTable for the same reason, and takes the global as a parameter rather than calling getenv
+ * so app/fleet stays pure and unit-testable — matching how `global_model` is threaded above. */
+std::string resolve_role_provider(const Settings &, const std::string &role, const char *global_provider);
+
+/* The per-worker `extra` spawn args carrying spawn-time identity: --model (live, resolved) + --provider
+ * (live, resolved routing block) + --role + --role-prompt (the overlay APPENDED after the base) +
+ * --role-tools (the tool-id subset). An empty overlay/csv is OMITTED, so an unconfigured role spawns
+ * exactly as the base (base prompt, all tools, free routing). */
 std::vector<std::string> role_spawn_args(const RoleTable &, const Settings &, const std::string &role,
-                                         bool live, const char *global_model);
+                                         bool live, const char *global_model,
+                                         const char *global_provider = nullptr);
 
 class Fleet {
 public:

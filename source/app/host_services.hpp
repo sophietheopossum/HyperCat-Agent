@@ -201,8 +201,14 @@ int consolidate_sessions(const HostServices &, const char *base_url, const char 
 
 /* Open a host-side CHAT hc_llm (+ its hc_http) — the build_llm pattern factored to one place (used by the
  * consolidation pass and the P05 planner). Returns the llm + the http via *out_http (free BOTH with
- * close_chat_llm), or nullptr (freeing nothing, refcount balanced) on failure / a missing model+key. */
-hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http);
+ * close_chat_llm), or nullptr (freeing nothing, refcount balanced) on failure / a missing model+key.
+ *
+ * `provider_json` is the per-role OpenRouter routing block (the INNER object, e.g.
+ * `{"quantizations":["fp8"]}`), resolved by resolve_role_provider. nullptr/empty falls back to
+ * HC_OPENROUTER_PROVIDER, and with that unset too the router picks freely. Borrowed for the call only —
+ * hc_llm copies it — so a caller may pass a temporary's c_str(). */
+hc_llm *open_chat_llm(const char *base_url, const char *model, const char *key, hc_http **out_http,
+                      const char *provider_json = nullptr);
 void    close_chat_llm(hc_llm *, hc_http *); /* frees both + balances the global-init refcount */
 
 /* The distinct roles in `pool`, first-seen order — the capability set offered to a decomposer (the planner

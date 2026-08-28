@@ -96,6 +96,21 @@ struct Settings {
     std::vector<ModelEntry>            models;      /* the operator's available-models catalog ([] = none) */
     std::map<std::string, std::string> role_models; /* role -> model id; SPARSE (a missing role uses `model`) */
 
+    /* role -> the OpenRouter provider-routing block, as the INNER object in canonical JSON
+     * (e.g. `{"quantizations":["fp8","bf16","fp16"]}`). SPARSE: a missing role uses HC_OPENROUTER_PROVIDER,
+     * and with that unset too the router picks freely — which is today's behaviour, byte-identical.
+     *
+     * Why a JSON blob and not a provider name: measured 27/8/2026, pinning ONE provider
+     * (`{"only":["DeepInfra"]}`) breaks any role whose model that endpoint does not host, while a
+     * QUANTISATION filter excludes 4-bit for every model and keeps fallbacks. The value has to be able to
+     * express the latter, so it is the routing object itself.
+     *
+     * NOTE the deliberate asymmetry with role_models: settings_validate applies NO referential rule here.
+     * role_models is pruned against the catalog, but there is no provider catalog and never will be — the
+     * endpoint list is OpenRouter's, live, and never fetched. A pasted in_catalog check would silently
+     * erase every assignment the operator makes. The structural check REPLACES it. */
+    std::map<std::string, std::string> role_providers;
+
     /* audio (Music Player) — GLOBAL, like the rest of this struct. The conductor "set the mood" tool is OPT-IN
      * (default OFF): when off, the conductor cannot see or play the audio library. */
     bool conductor_mood_enabled = false; /* may the conductor browse + play the audio library to set the mood */
@@ -140,11 +155,24 @@ struct EnvOverrides {
 constexpr size_t kMaxPanels = 64;
 constexpr size_t kMaxEgress = 256;
 constexpr size_t kMaxModels = 64;    /* the available-models catalog cap (W2) */
+constexpr size_t kMaxRoleProviders = 64;         /* cap on the per-role provider-routing map */
+constexpr size_t kMaxProviderRoutingBytes = 512; /* cap on ONE canonical routing block (the UI edits in a
+                                                  * 512-byte buffer; keep the two in step) */
 constexpr size_t kMaxExecAllow = 64; /* the exec allowlist cap (W4; matches hc::kMaxExecAllow) */
 constexpr size_t kMaxToolsMap = 128; /* cap on the system_tools / thirdparty_tools enable maps (Custom Tooling) */
 constexpr size_t kMaxConductorPersonaBytes =
     8u * 1024; /* global-persona hygiene bound at load; mirrors conductor_prompt::kMaxPersonaBytes (the
                 * authoritative, UTF-8-safe cap applied at prompt assembly) */
+
+/* PURE: validate and CANONICALISE one provider-routing block in place. True iff `json` parses as a JSON
+ * OBJECT whose canonical form fits kMaxProviderRoutingBytes; on true `json` is replaced by that canonical
+ * form, on false it is left untouched and the caller drops the entry.
+ *
+ * The re-emit is the mechanism, not cosmetics. A bare parse-and-check gate is provably insufficient: cJSON
+ * accepts trailing content after the root value, so `{"a":1} JUNK` is "a valid object" to any such gate.
+ * Printing back from the PARSED TREE is what discards the tail. Exported so a caller can REJECT an
+ * operator's edit with a message instead of silently pruning it later. */
+bool settings_normalize_provider_routing(std::string &json);
 
 /* PURE: parse a settings JSON document (`json`, `len` bytes) into `out`. Unknown keys are ignored; absent
  * keys keep `out`'s current value (so call on a default-constructed Settings). Returns false on a parse

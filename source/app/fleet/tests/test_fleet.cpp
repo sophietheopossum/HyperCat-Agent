@@ -54,6 +54,28 @@ int main()
     CHECK(resolve_role_model(rt, st, "ops", "global") == "global", "no override + no table entry -> the global");
     CHECK(resolve_role_model(rt, st, "ops", nullptr).empty(), "nothing applies -> empty");
 
+    /* per-role provider routing: TWO tiers (operator map > global), and INDEPENDENT of the model chain --
+     * a role with a model override but no routing override still gets the global routing. That decoupling
+     * is the whole feature: the planner can be pinned to fp8 while the conductor routes freely. */
+    st.role_providers["planner"] = "{\"quantizations\":[\"fp8\"]}";
+    CHECK(provider_override(st, "planner") == "{\"quantizations\":[\"fp8\"]}", "provider_override returns the map entry");
+    CHECK(provider_override(st, "dev").empty(), "provider_override is empty for an unrouted role");
+    CHECK(resolve_role_provider(st, "planner", "{\"sort\":\"price\"}") == "{\"quantizations\":[\"fp8\"]}",
+          "the operator's per-role routing beats the global");
+    CHECK(resolve_role_provider(st, "dev", "{\"sort\":\"price\"}") == "{\"sort\":\"price\"}",
+          "a role with a MODEL override but no routing override still inherits the global routing");
+    CHECK(resolve_role_provider(st, "dev", nullptr).empty(), "no override + no global -> free routing");
+
+    /* role_spawn_args carries --provider only when one resolves, and only when live */
+    auto planner_live = role_spawn_args(rt, st, "planner", true, "global", nullptr);
+    CHECK(has_pair(planner_live, "--provider", "{\"quantizations\":[\"fp8\"]}"), "planner carries its routing");
+    auto dev_noroute = role_spawn_args(rt, st, "dev", true, "global", nullptr);
+    CHECK(!has_flag(dev_noroute, "--provider"), "an unrouted role emits no --provider");
+    auto dev_global = role_spawn_args(rt, st, "dev", true, "global", "{\"sort\":\"price\"}");
+    CHECK(has_pair(dev_global, "--provider", "{\"sort\":\"price\"}"), "the global routing reaches an unrouted role");
+    auto planner_off = role_spawn_args(rt, st, "planner", false, "global", "{\"sort\":\"price\"}");
+    CHECK(!has_flag(planner_off, "--provider"), "offline mode carries no routing (nor a model)");
+
     /* role_spawn_args: live dev -> --model + --role + --role-prompt + --role-tools (a subset) */
     auto dev_live = role_spawn_args(rt, st, "dev", true, "global");
     CHECK(has_pair(dev_live, "--model", "operator-dev-model"), "dev (live) carries its resolved model");

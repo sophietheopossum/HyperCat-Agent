@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@
 #include <unistd.h>
 
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -34,6 +36,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
+#include <linux/openat2.h>
 #include <linux/seccomp.h>
 #include <stddef.h>
 #include <sys/prctl.h>
@@ -62,6 +65,7 @@ const char *hc_exec_strerror(hc_exec_status s)
     case HC_EXEC_ERR_SPAWN:       return "could not spawn the child";
     case HC_EXEC_ERR_CONFINE:     return "could not confine the child (it was not run)";
     case HC_EXEC_ERR_NOMEM:       return "out of memory";
+    case HC_EXEC_ERR_READ_ROOT:   return "a granted read folder cannot be granted as it stands (nothing was run)";
     }
     return "unknown";
 }
@@ -103,7 +107,8 @@ struct rlimit_set {
     long cpu, mem, fsize, nproc, nofile;
 };
 
-/* ---- Landlock: confine fs access to the workspace (rw) + the system dirs the loader needs (r-x) ------ */
+/* ---- Landlock: confine fs access to the workspace (rw) + the system dirs the loader needs (r-x) + any
+ * operator-granted read roots (r--) ------ */
 
 static int ll_create_ruleset(const struct landlock_ruleset_attr *attr, size_t size, __u32 flags)
 {
@@ -129,9 +134,33 @@ static int ll_allow(int ruleset_fd, const char *path, uint64_t access)
     return rc;
 }
 
+/* Grant `dir_access` on an operator read root the parent has already vetted (hc_exec_read_root_problem). It is
+ * opened with RESOLVE_NO_SYMLINKS: the root is canonical, so a symlink on its path now means it was swapped
+ * after the parent's check, and following it would grant somewhere the operator never approved -- that fails
+ * the confinement instead. A regular file gets READ_FILE alone (Landlock refuses directory rights on a file);
+ * anything else (a FIFO, socket or device) is refused. A root that has vanished is skipped, like ll_allow. */
+static int ll_allow_root(int ruleset_fd, const char *path, uint64_t dir_access)
+{
+    struct open_how how = {.flags = O_PATH | O_CLOEXEC, .resolve = RESOLVE_NO_SYMLINKS};
+    int             fd = (int)syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof how);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    uint64_t    access = 0;
+    if (fstat(fd, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) access = dir_access;
+        else if (S_ISREG(st.st_mode)) access = dir_access & LANDLOCK_ACCESS_FS_READ_FILE;
+    }
+    struct landlock_path_beneath_attr pb = {.allowed_access = access, .parent_fd = fd};
+    int rc = access ? ll_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &pb, 0) : -1;
+    int e = errno;
+    close(fd);
+    errno = e;
+    return rc;
+}
+
 /* Build + enforce the Landlock ruleset. Returns 0 on success, -1 if Landlock is unavailable or any step on an
  * existing path fails (fail-closed). Best-effort ABI masking so it works across kernels >= the ABI we need. */
-static int apply_landlock(const char *cwd)
+static int apply_landlock(const char *cwd, const char *const *read_roots)
 {
     long abi = syscall(SYS_landlock_create_ruleset, (void *)NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
     if (abi < 1) return -1; /* no Landlock -> fail closed */
@@ -180,6 +209,11 @@ static int apply_landlock(const char *cwd)
     int rc = 0;
     for (const char *const *d = sysdirs; *d && rc == 0; d++) rc = ll_allow(rs, *d, sys_rx);
     if (rc == 0) rc = ll_allow(rs, "/etc", sys_r); /* config: read only */
+    /* Operator-granted read roots: READ only, exactly like /etc. No execute, so a binary that happens to live
+     * under a read root still cannot be run (only the system dirs above carry EXECUTE); no write, so the
+     * workspace stays the ONLY writable subtree. Landlock grants are a union, so a root that contains the
+     * workspace or a system dir cannot take their rights away either. */
+    for (const char *const *r = read_roots; r && *r && rc == 0; r++) rc = ll_allow_root(rs, *r, sys_r);
     if (rc == 0)
         rc = ll_allow(rs, "/dev/null",
                       (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE) & handled);
@@ -321,7 +355,7 @@ static void child_confine_and_exec(const hc_exec_spec *spec, const struct rlimit
 
     /* no_new_privs is REQUIRED before seccomp and hardens Landlock (no setuid escalation) */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) child_fail(errfd, kStageNoNewPrivs);
-    if (apply_landlock(spec->cwd) != 0) child_fail(errfd, kStageLandlock);
+    if (apply_landlock(spec->cwd, spec->read_roots) != 0) child_fail(errfd, kStageLandlock);
     if (apply_seccomp() != 0) child_fail(errfd, kStageSeccomp);
 
     /* the scrubbed environment — the host's env (incl. any API key) is NOT inherited. HOME points at the
@@ -426,6 +460,124 @@ static void parent_capture(int cap_fd, int err_fd, char *buf, long cap, long tim
 }
 #endif /* HC_EXEC_LINUX */
 
+/* ---- operator read roots: the ONE place their rules live (settings, policy and the host bridge call the
+ * hc_exec_read_root_* functions; hc_exec_run applies the same checks). The header says what each promises. */
+enum { kMaxReadRoots = HC_EXEC_MAX_READ_ROOTS };
+
+static int read_root_forbidden(const char *p)
+{
+    if (strcmp(p, "/") == 0) return 1;
+    static const char *const trees[] = {"/proc", "/dev", "/sys", NULL};
+    for (const char *const *t = trees; *t; t++) {
+        size_t n = strlen(*t);
+        if (strncmp(p, *t, n) == 0 && (p[n] == '\0' || p[n] == '/')) return 1;
+    }
+    return 0;
+}
+
+/* 1 if `p` is `dir` or lies beneath it (both canonical). */
+static int path_within(const char *p, const char *dir)
+{
+    size_t n = strlen(dir);
+    return strncmp(p, dir, n) == 0 && (p[n] == '\0' || p[n] == '/' || (n == 1 && dir[0] == '/'));
+}
+
+/* 1 if any segment of `p` is `.` or `..`. */
+static int has_dot_segment(const char *p)
+{
+    for (const char *s = strchr(p, '/'); s; s = strchr(s, '/')) {
+        s++;
+        size_t n = strcspn(s, "/");
+        if ((n == 1 && s[0] == '.') || (n == 2 && s[0] == '.' && s[1] == '.')) return 1;
+    }
+    return 0;
+}
+
+/* A root is a folder (read it and list beneath it) or one regular file. */
+static int grantable_kind(mode_t m) { return S_ISDIR(m) || S_ISREG(m); }
+
+int hc_exec_read_root_valid(const char *path)
+{
+    return path && path[0] == '/' && strlen(path) < PATH_MAX && !has_dot_segment(path) &&
+           !read_root_forbidden(path);
+}
+
+char *hc_exec_read_root_canonical(const char *path)
+{
+    if (!hc_exec_read_root_valid(path)) return NULL;
+    char       *c = realpath(path, NULL);
+    struct stat st;
+    if (!c || read_root_forbidden(c) || stat(c, &st) != 0 || !grantable_kind(st.st_mode)) {
+        free(c);
+        return NULL;
+    }
+    return c;
+}
+
+/* hc_exec_read_root_problem against an already-canonical workspace `ws` (or NULL). *skip is set when the root
+ * adds nothing to the grant: it is absent, or inside the workspace -- readable anyway, and a place the model
+ * can rearrange, so it is never resolved at all. */
+static const char *read_root_problem(const char *root, const char *ws, int *skip)
+{
+    *skip = 0;
+    if (!hc_exec_read_root_valid(root)) return "is not an absolute path clear of /, /proc, /dev and /sys";
+    if (ws && path_within(root, ws)) {
+        *skip = 1;
+        return NULL;
+    }
+    char *c = realpath(root, NULL);
+    if (!c) {
+        if (errno == ENOENT) {
+            *skip = 1;
+            return NULL;
+        }
+        return "can no longer be resolved (a folder on its path is unreadable, or a symlink loops)";
+    }
+    int moved = strcmp(c, root) != 0;
+    free(c);
+    if (moved)
+        return "no longer resolves to itself: a symlink is on its path (or it was never added through "
+               "Settings), so it would grant somewhere else";
+    struct stat st;
+    if (stat(root, &st) != 0) {
+        if (errno == ENOENT) {
+            *skip = 1;
+            return NULL;
+        }
+        return "can no longer be resolved";
+    }
+    if (!grantable_kind(st.st_mode)) return "is not a folder or a regular file";
+    return NULL;
+}
+
+const char *hc_exec_read_root_problem(const char *path, const char *workspace)
+{
+    char       *ws = workspace ? realpath(workspace, NULL) : NULL;
+    int         skip;
+    const char *why = read_root_problem(path, ws, &skip);
+    free(ws);
+    return why;
+}
+
+#ifdef HC_EXEC_LINUX
+/* Keep the roots of `roots` that the jail should grant (borrowed, NULL-terminated into `keep`, which holds
+ * kMaxReadRoots + 1). 0 if any root has a problem or there are more than kMaxReadRoots. */
+static int vet_read_roots(const char *const *roots, const char *cwd, const char **keep)
+{
+    char  *ws = realpath(cwd, NULL); /* NULL if the workspace is gone: nothing is skipped, and the run fails later */
+    size_t n = 0, seen = 0;
+    int    ok = 1;
+    for (const char *const *r = roots; r && *r && ok; r++, seen++) {
+        int skip = 0;
+        if (seen >= kMaxReadRoots || read_root_problem(*r, ws, &skip)) ok = 0;
+        else if (!skip) keep[n++] = *r;
+    }
+    free(ws);
+    keep[n] = NULL;
+    return ok;
+}
+#endif /* HC_EXEC_LINUX */
+
 hc_exec_status hc_exec_run(const hc_exec_spec *spec, hc_exec_result *out)
 {
     if (out) memset(out, 0, sizeof *out);
@@ -439,6 +591,16 @@ hc_exec_status hc_exec_run(const hc_exec_spec *spec, hc_exec_result *out)
     /* refuse early if Landlock is missing on THIS kernel, so the caller gets UNSUPPORTED (not CONFINE) */
     if (syscall(SYS_landlock_create_ruleset, (void *)NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1)
         return HC_EXEC_ERR_UNSUPPORTED;
+
+    /* Vet the operator's read roots HERE, in the parent, before anything is spawned; only the ones to grant
+     * reach the jail (inside the workspace or absent ones drop out), and any root with a problem refuses the
+     * run. The child re-opens each without following symlinks (ll_allow_root), so what it grants is what was
+     * checked here. */
+    const char *roots[kMaxReadRoots + 1];
+    if (!vet_read_roots(spec->read_roots, spec->cwd, roots)) return HC_EXEC_ERR_READ_ROOT;
+    hc_exec_spec jailed = *spec;
+    jailed.read_roots = roots[0] ? roots : NULL;
+    spec = &jailed;
 
     long timeout = spec->timeout_ms > 0 ? spec->timeout_ms : kDefTimeoutMs;
     if (timeout > kMaxTimeoutMs) timeout = kMaxTimeoutMs;

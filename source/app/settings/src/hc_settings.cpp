@@ -17,6 +17,7 @@
 
 #include "hc_fs.h"
 #include "hc_json.h"
+#include "hc_exec.h" /* hc_exec_read_root_valid: the run jail's own spelling rule for a read root */
 
 #include <climits>
 #include <cstdlib>
@@ -133,6 +134,15 @@ bool settings_parse(const char *json, size_t len, Settings &out)
             for (size_t i = 0; i < n && out.exec_allow.size() < kMaxExecAllow; i++) {
                 const char *s = hc_json_as_str(hc_json_arr_at(xa, i), "");
                 if (s && s[0]) out.exec_allow.emplace_back(s);
+            }
+        }
+        const hc_json *xr = hc_json_get(sec, "exec_read_roots"); /* read-only roots for the run jail */
+        if (xr && hc_json_is_array(xr)) {
+            out.exec_read_roots.clear();
+            const size_t n = hc_json_arr_len(xr);
+            for (size_t i = 0; i < n && out.exec_read_roots.size() < HC_EXEC_MAX_READ_ROOTS; i++) {
+                const char *s = hc_json_as_str(hc_json_arr_at(xr, i), "");
+                if (s && s[0]) out.exec_read_roots.emplace_back(s);
             }
         }
     }
@@ -265,6 +275,10 @@ std::string settings_serialize(const Settings &s)
         if (hc_json *xa = hc_json_new_array()) {
             for (const auto &p : s.exec_allow) hc_json_arr_append_str(xa, p.c_str());
             hc_json_obj_set(sec, "exec_allow", xa);
+        }
+        if (hc_json *xr = hc_json_new_array()) {
+            for (const auto &p : s.exec_read_roots) hc_json_arr_append_str(xr, p.c_str());
+            hc_json_obj_set(sec, "exec_read_roots", xr);
         }
         hc_json_obj_set(root, "security", sec);
     }
@@ -413,6 +427,18 @@ void settings_validate(Settings &s)
         if (kept_exec.size() >= kMaxExecAllow) break;
     }
     s.exec_allow = std::move(kept_exec);
+
+    /* exec_read_roots: drop what can NEVER be a root by its spelling (relative, `.`/`..`, /, /proc, /dev, /sys)
+     * and cap at what the jail accepts. Deliberately judged without touching the filesystem: a root that is
+     * absent right now (an unmounted drive) is kept rather than silently lost on the next unrelated save --
+     * runs skip it while it is absent, and refuse it with a named reason if it resolves somewhere else. */
+    std::vector<std::string> kept_roots;
+    for (auto &p : s.exec_read_roots) {
+        if (!hc_exec_read_root_valid(p.c_str())) continue;
+        kept_roots.push_back(p);
+        if (kept_roots.size() >= HC_EXEC_MAX_READ_ROOTS) break;
+    }
+    s.exec_read_roots = std::move(kept_roots);
 
     /* models (W2): drop empty ids, cap the catalog, and keep role assignments REFERENTIALLY CONSISTENT — a
      * role mapped to a model that isn't in the catalog is dropped (it would resolve to nothing). */

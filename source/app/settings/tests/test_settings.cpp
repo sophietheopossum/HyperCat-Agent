@@ -49,6 +49,7 @@ static void test_round_trip()
     s.task_deadline_ms = 240000;
     s.egress_allow = {"192.168.1.50", "::1"};
     s.exec_allow = {"/usr/bin/git", "/bin/sh"};
+    s.exec_read_roots = {"/usr/share", "/var/log"};
     s.models = {{"google/gemini-3.5-flash", "fast/cheap"}, {"anthropic/claude", "best for code"}};
     s.role_models = {{"dev", "anthropic/claude"}, {"research", "google/gemini-3.5-flash"}};
     /* automation (B3/B4): the persistence layer is FAITHFUL — both round-trip as set. The session-scoped disarm of
@@ -78,12 +79,24 @@ static void test_round_trip()
     CHECK(r.deep_reason_budget == 6 && r.task_deadline_ms == 240000);
     CHECK(r.egress_allow.size() == 2 && r.egress_allow[0] == "192.168.1.50" && r.egress_allow[1] == "::1");
     CHECK(r.exec_allow.size() == 2 && r.exec_allow[0] == "/usr/bin/git" && r.exec_allow[1] == "/bin/sh"); /* W4 */
+    CHECK(r.exec_read_roots.size() == 2 && r.exec_read_roots[0] == "/usr/share" && r.exec_read_roots[1] == "/var/log");
     /* W4: validate drops a non-absolute / `..` exec entry, keeps the absolute one */
     {
         Settings v;
         v.exec_allow = {"/usr/bin/ok", "relative/bad", "/has/../dotdot"};
         settings_validate(v);
         CHECK(v.exec_allow.size() == 1 && v.exec_allow[0] == "/usr/bin/ok");
+    }
+    /* read roots: validate drops what can never be a root by its spelling -- the whole filesystem, a
+     * kernel/device tree (which Landlock could not carve back out), relative or `..` -- but KEEPS one that is
+     * merely absent now (an unmounted drive), so an unrelated save cannot silently delete it */
+    {
+        Settings v;
+        v.exec_read_roots = {"/usr/share", "/",           "/proc",   "/dev/input", "/sys/class",
+                             "relative/dir", "/a/../b", "/no/such/dir/xyzzy"};
+        settings_validate(v);
+        CHECK(v.exec_read_roots.size() == 2 && v.exec_read_roots[0] == "/usr/share" &&
+              v.exec_read_roots[1] == "/no/such/dir/xyzzy");
     }
     /* W2: the models catalog + the sparse per-role assignment round-trip */
     CHECK(r.models.size() == 2 && r.models[0].id == "google/gemini-3.5-flash" &&

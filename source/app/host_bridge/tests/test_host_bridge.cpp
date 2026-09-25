@@ -436,7 +436,17 @@ int main()
             if (agent == "agent:Y") return {"/bin/true"}; /* excludes /bin/echo -> narrows it away */
             return {};                                    /* agent:X: no narrowing                  */
         };
-        gate->enable_exec({"/bin/echo"}, wsroot, false, role_exec_fn); /* allowlist /bin/echo; per-role narrowing */
+        /* a read root OUTSIDE the workspace holding a marker file, granted to every run's jail */
+        char rroot[160], rrfile[200];
+        std::snprintf(rroot, sizeof rroot, "/tmp/hc_exec_gate_rr_%ld", (long)getpid());
+        std::snprintf(rrfile, sizeof rrfile, "%s/marker.txt", rroot);
+        mkdir(rroot, 0700);
+        if (FILE *mf = std::fopen(rrfile, "w")) {
+            std::fputs("gate-read-root-marker\n", mf);
+            std::fclose(mf);
+        }
+        gate->enable_exec({"/bin/echo", "/bin/cat"}, wsroot, false, role_exec_fn,
+                          {rroot}); /* allowlist echo + cat; per-role narrowing; one read root */
 
         bool landlock_ok = true;
         /* allowed: an allowlisted binary surfaces as `run`, and on approval runs + returns its output */
@@ -485,6 +495,42 @@ int main()
                 CHECK(recv_exec(X, 12, approved2, out2, ec2) && !approved2,
                       "an operator-denied command is not run");
             }
+
+            /* read roots reach the jail: /bin/cat of a file under the granted root, OUTSIDE the workspace */
+            CHECK(X->send_request("authgate", 13, exec_body({"/bin/cat", rrfile})),
+                  "worker sends tool.exec for cat of a file under a read root");
+            std::vector<PendingAuthView> p4;
+            if (wait_count(gate, 1, p4) && p4.size() == 1) {
+                gate->resolve(p4[0].id, true);
+                bool        approved4 = false;
+                std::string out4;
+                long        ec4 = -1;
+                CHECK(recv_exec(X, 13, approved4, out4, ec4) && approved4 && ec4 == 0 &&
+                          out4.find("gate-read-root-marker") != std::string::npos,
+                      "a file under an operator read root is readable by the jailed command");
+            } else
+                CHECK(false, "the read-root exec request did not surface");
+
+            /* a root that has become a symlink is refused, NAMED, and not followed: the run does not happen */
+            std::string real = std::string(rroot) + ".real";
+            CHECK(rename(rroot, real.c_str()) == 0 && symlink(real.c_str(), rroot) == 0,
+                  "test setup: the read root becomes a symlink");
+            CHECK(X->send_request("authgate", 14, exec_body({"/bin/cat", rrfile})),
+                  "worker sends tool.exec for cat through the swapped root");
+            std::vector<PendingAuthView> p5;
+            if (wait_count(gate, 1, p5) && p5.size() == 1) {
+                gate->resolve(p5[0].id, true);
+                bool        approved5 = true;
+                std::string out5;
+                long        ec5 = 0;
+                CHECK(recv_exec(X, 14, approved5, out5, ec5) && !approved5 &&
+                          out5.find(rroot) != std::string::npos && out5.find("symlink") != std::string::npos &&
+                          out5.find("gate-read-root-marker") == std::string::npos,
+                      "a swapped read root refuses the run and the reply names it");
+            } else
+                CHECK(false, "the swapped-root exec request did not surface");
+            unlink(rroot);
+            rename(real.c_str(), rroot);
         }
 
         /* P06: per-role exec narrowing — agent:Y's role excludes /bin/echo, so a GLOBALLY-allowed binary is
@@ -510,6 +556,8 @@ int main()
         rmdir(ydir.c_str());
         rmdir(adir.c_str());
         rmdir(wsroot);
+        unlink(rrfile);
+        rmdir(rroot);
     }
 
     /* --- P09.2: the CapabilityAuthority — mint, prompt-free cap.check, budget, scope, subject-bind, revoke,

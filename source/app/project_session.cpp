@@ -185,7 +185,7 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
             return {};
         };
         s->svc_.gate->enable_exec(settings->settings.exec_allow, s->info_.ws_root, s->info_.shared_workspace,
-                                  std::move(role_exec_fn));
+                                  std::move(role_exec_fn), settings->settings.exec_read_roots);
     }
 
     /* W1.3: confirm a file-producing task actually wrote its declared deliverable before it settles Done. */

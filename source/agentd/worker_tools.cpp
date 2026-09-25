@@ -539,8 +539,10 @@ char *memory_write_invoke(const char *args_json, void *user)
 const char kRunName[] = "run";
 const char kRunSpec[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"run\",\"description\":\"Run an allowlisted command (e.g. a "
-    "test runner or build tool) in a kernel-sandboxed child (NO network; can only touch your workspace) and get "
-    "back its combined stdout+stderr and exit code. Each run needs operator approval. Provide the command as an "
+    "test runner or build tool) in a kernel-sandboxed child and get back its combined stdout+stderr and exit "
+    "code. NO network. It can WRITE only inside your workspace, and READ your workspace, the system dirs, and any "
+    "extra folders the operator has granted -- reading anything else fails with permission denied. There is no "
+    "shell expansion and HOME is your workspace, so name files outside it by ABSOLUTE path. Each run needs operator approval. Provide the command as an "
     "argv ARRAY (no shell parsing): argv[0] is the ABSOLUTE path to the "
     "binary.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"argv\":{\"type\":\"array\",\"items\":{"
     "\"type\":\"string\"},\"description\":\"the command + args; argv[0] = an absolute binary path\"}},"
@@ -614,15 +616,46 @@ char *run_invoke(const char *args_json, void *user)
     }
     if (dismissed)
         return dup_str("deferred: the operator set this aside — the command did not run; ask again if still needed");
-    if (!approved)
-        return dup_str("denied: the operator declined the command, or it is not on the run allowlist");
+    if (!approved) /* the host names its reason when the command was approved but could not run */
+        return dup_str(output.empty() ? "denied: the operator declined the command, or it is not on the run allowlist"
+                                      : "not run: " + output);
     std::string res = "exit " + std::to_string(exit_code) + (timed_out ? " (TIMED OUT — killed)\n" : "\n") +
                       (output.empty() ? "(no output)" : output);
     if (res.size() > 240u * 1024) res.resize(240u * 1024);
     return dup_str(res);
 }
 
+/* `s` escaped for the inside of a JSON string literal */
+std::string json_escaped(const std::string &s)
+{
+    std::string o;
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            o += '\\';
+            o += (char)c;
+        } else if (c < 0x20) {
+            char b[8];
+            snprintf(b, sizeof b, "\\u%04x", c);
+            o += b;
+        } else
+            o += (char)c;
+    }
+    return o;
+}
+
 } // namespace
+
+std::string run_tool_spec(const std::vector<std::string> &read_roots)
+{
+    std::string       s = kRunSpec;
+    static const char anchor[] = "any extra folders the operator has granted";
+    size_t            at = s.find(anchor);
+    if (read_roots.empty() || at == std::string::npos) return s;
+    std::string list = " (";
+    for (size_t i = 0; i < read_roots.size(); i++) list += (i ? ", " : "") + json_escaped(read_roots[i]);
+    s.insert(at + sizeof anchor - 1, list + ")");
+    return s;
+}
 
 std::string query_memory(BusClient &bus, uint64_t *corr, const std::string &query)
 {
@@ -715,7 +748,7 @@ void register_agent_tools(hc_agent *ag, FsToolCtx *fs, ReasonToolCtx *rz, MemToo
         }
     }
     if (exec_enabled && run) { /* the run tool exists ONLY when the operator has a non-empty exec allowlist */
-        hc_agent_tool t{kRunName, kRunSpec, run_invoke, run};
+        hc_agent_tool t{kRunName, run->spec.empty() ? kRunSpec : run->spec.c_str(), run_invoke, run};
         hc_agent_add_tool(ag, &t);
     }
     if (skills && skills->sb && on.load_skill) { /* W6 P6.2: only when a skills dir exists AND the role allows */

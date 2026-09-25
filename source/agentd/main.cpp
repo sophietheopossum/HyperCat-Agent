@@ -110,6 +110,7 @@ int main(int argc, char **argv)
     if (role_prompt) cfg.role_prompt = role_prompt;
     if (role_tools) cfg.role_tools = role_tools;
     cfg.exec_enabled = has_flag(argc, argv, "--exec-enabled"); /* W4.3: register the run tool (host-gated) */
+    cfg.exec_read_roots = opt_all(argc, argv, "--exec-read-root"); /* named in the run tool's description */
     if (model) cfg.model = model;
     if (base_url) cfg.base_url = base_url;
     if (provider) cfg.provider = provider;

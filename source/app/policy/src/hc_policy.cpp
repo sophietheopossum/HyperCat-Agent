@@ -12,6 +12,7 @@
  */
 
 #include "hc_policy.hpp"
+#include "hc_exec.h" /* hc_exec_read_root_canonical + HC_EXEC_MAX_READ_ROOTS: the run jail's own rule */
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -207,6 +208,31 @@ EgressDecision egress_decide(const EgressPolicy &p, const hc_http_peer *peer)
     /* fall through to the UNCHANGED IP classifier (the strong anti-SSRF default-deny-non-Public) */
     if (!p.allow_decision(peer->family, peer->ip)) return {false, EgressVerdict::DenyIpClass};
     return {true, EgressVerdict::Allow};
+}
+
+static_assert(kMaxExecReadRoots == HC_EXEC_MAX_READ_ROOTS, "the settings cap must equal the run jail's cap");
+
+bool exec_read_root_edit(std::vector<std::string> &roots, const char *path, bool add, std::string *stored)
+{
+    if (!path || !*path) return false;
+    if (add) {
+        char *c = hc_exec_read_root_canonical(path); /* the run jail's own rule; NULL = it would refuse it */
+        if (!c) return false;
+        std::string canon = c;
+        free(c);
+        for (const auto &e : roots)
+            if (e == canon) return false; /* dedup (on what is stored, so two spellings are one root) */
+        if (roots.size() >= kMaxExecReadRoots) return false; /* bounded */
+        roots.push_back(canon);
+        if (stored) *stored = canon;
+        return true;
+    }
+    for (auto it = roots.begin(); it != roots.end(); ++it)
+        if (*it == path) {
+            roots.erase(it);
+            return true;
+        }
+    return false;
 }
 
 } // namespace hc

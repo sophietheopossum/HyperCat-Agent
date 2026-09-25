@@ -5,6 +5,9 @@
 #include "hc_policy.hpp"
 
 #include <cstdio>
+#include <string>
+
+#include <unistd.h>
 
 using hc::EgressPolicy;
 using hc::ExecPolicy;
@@ -199,6 +202,39 @@ int main()
         /* the cap */
         std::vector<std::string> capd(hc::kMaxExecAllow, "/x");
         CHECK(!hc::exec_allow_edit(capd, "/bin/sh", true), "add: rejected at the cap");
+    }
+
+    /* --- exec_read_root_edit: the host-authoritative read-root mutation (the run jail's own rule) --- */
+    {
+        std::vector<std::string> rr;
+        CHECK(hc::exec_read_root_edit(rr, "/usr/share", true) && rr.size() == 1, "read root: an existing dir is added");
+        CHECK(!hc::exec_read_root_edit(rr, "/usr/share", true), "read root: a duplicate is rejected (no change)");
+        CHECK(!hc::exec_read_root_edit(rr, "/", true), "read root: the whole filesystem is refused");
+        CHECK(!hc::exec_read_root_edit(rr, "/proc", true), "read root: /proc is refused");
+        CHECK(!hc::exec_read_root_edit(rr, "/dev", true), "read root: /dev is refused");
+        CHECK(!hc::exec_read_root_edit(rr, "/sys/kernel", true), "read root: inside /sys is refused");
+        CHECK(!hc::exec_read_root_edit(rr, "relative/dir", true), "read root: a relative path is rejected");
+        CHECK(!hc::exec_read_root_edit(rr, "/usr/../etc", true), "read root: a path with .. is rejected");
+        CHECK(!hc::exec_read_root_edit(rr, "/no/such/dir/xyzzy", true), "read root: a non-existent path is rejected");
+        CHECK(hc::exec_read_root_edit(rr, "/usr/share", false) && rr.empty(), "read root: remove erases a present entry");
+        CHECK(!hc::exec_read_root_edit(rr, "/usr/share", false), "read root: removing an absent entry is a no-op");
+        std::vector<std::string> capd(hc::kMaxExecReadRoots, "/x");
+        CHECK(!hc::exec_read_root_edit(capd, "/var", true), "read root: rejected at the cap");
+
+        /* a symlink is stored as the folder it names (the grant the operator actually made), so the same
+         * folder under a second spelling is a duplicate, and a symlink into /proc is refused by its target */
+        const std::string link = "/tmp/hc_policy_rr_" + std::to_string(getpid());
+        const std::string plink = link + "_proc";
+        CHECK(symlink("/usr/share", link.c_str()) == 0 && symlink("/proc", plink.c_str()) == 0,
+              "read root: test setup (symlinks)");
+        std::string stored;
+        CHECK(hc::exec_read_root_edit(rr, link.c_str(), true, &stored) && stored == "/usr/share" &&
+                  rr.size() == 1 && rr[0] == "/usr/share",
+              "read root: a symlink is stored resolved");
+        CHECK(!hc::exec_read_root_edit(rr, "/usr/share", true), "read root: its target is then a duplicate");
+        CHECK(!hc::exec_read_root_edit(rr, plink.c_str(), true), "read root: a symlink into /proc is refused");
+        unlink(link.c_str());
+        unlink(plink.c_str());
     }
 
     if (g_fails) {

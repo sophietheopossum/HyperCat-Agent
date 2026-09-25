@@ -63,8 +63,12 @@ typedef enum {
     HC_EXEC_ERR_UNSUPPORTED,   /* this build/kernel lacks Landlock+seccomp — exec is refused (fail-closed)    */
     HC_EXEC_ERR_SPAWN,         /* fork/pipe/exec plumbing failed on the host side                             */
     HC_EXEC_ERR_CONFINE,       /* the child could not be confined (it _exited without running anything)       */
-    HC_EXEC_ERR_NOMEM          /* allocation failure                                                          */
+    HC_EXEC_ERR_NOMEM,         /* allocation failure                                                          */
+    HC_EXEC_ERR_READ_ROOT      /* a read root cannot be granted as it stands (hc_exec_read_root_problem says why) */
 } hc_exec_status;
+
+/* The most read roots one run accepts; hc_exec_run refuses a spec carrying more. Settings cap at this too. */
+#define HC_EXEC_MAX_READ_ROOTS 32
 
 /* One execution request. All pointers are BORROWED for the duration of the call. Any numeric limit <= 0 takes
  * a built-in conservative default (documented at hc_exec_run). argv[0] MUST be an absolute path (the host
@@ -79,6 +83,13 @@ typedef struct {
     long               fsize_bytes;   /* RLIMIT_FSIZE (largest file the child may write)                       */
     long               max_procs;     /* RLIMIT_NPROC (fork-bomb floor)                                        */
     long               max_files;     /* RLIMIT_NOFILE                                                         */
+    /* Extra folders (or single regular files) the child may READ but never write, create, remove or execute
+     * from. NULL-terminated, or NULL for none (the default: the workspace plus the loader's system dirs only).
+     * Each must be CANONICAL -- the path hc_exec_read_root_canonical returned when the operator added it --
+     * and still resolve to itself: see hc_exec_read_root_problem. A root that does not exist, or lies inside
+     * the workspace (already readable), is skipped. The operator chooses these; anything readable here can
+     * reach the model through the command's output, so they are a disclosure decision. */
+    const char *const *read_roots;
 } hc_exec_spec;
 
 /* The result of an HC_EXEC_OK run. `output` is a heap buffer (NUL-terminated, <= max_output) the caller frees
@@ -99,6 +110,29 @@ typedef struct {
  * RLIMIT_NPROC is OFF unless spec.max_procs > 0 (see the banner — a low per-UID/per-task cap breaks forking).
  * The child runs with the scrubbed env; the parent's env (incl. any API key) is NEVER inherited. */
 hc_exec_status hc_exec_run(const hc_exec_spec *spec, hc_exec_result *out);
+
+/* Read roots. Landlock can only ALLOW, so a grant cannot carve anything back out of a folder: a root is never
+ * the whole filesystem or inside /proc, /dev or /sys (other processes' environments -- where the provider key
+ * lives -- and the input devices). Pure (no state); safe from any thread.
+ *
+ * hc_exec_read_root_valid: 1 if `path` is SPELLED like a root: absolute, no `.`/`..` segment, not / or inside
+ * /proc, /dev, /sys. Touches no file, so the answer never changes -- the settings layer keeps a root that is
+ * merely absent today (an unmounted drive) instead of losing it on the next unrelated save.
+ *
+ * hc_exec_read_root_canonical: the path to STORE when the operator adds `path`: every symlink resolved, and
+ * only if it exists now, is a folder or a regular file (not a FIFO, socket or device, whose reader would take
+ * another process's stream), and is valid once resolved. malloc'd (the caller free()s it), or NULL.
+ *
+ * hc_exec_read_root_problem: why hc_exec_run would refuse `path` for a run whose workspace is `workspace`
+ * (either may be NULL), or NULL when it would grant or skip it. A stored root must still resolve to itself:
+ * one that now resolves elsewhere has had a symlink put on its path, and following it would grant whatever
+ * that names instead of what the operator approved. The jail then opens each root without following
+ * symlinks, so a swap between this check and the grant fails the confinement rather than redirecting it. The
+ * returned string is static. hc_exec_run applies this to every spec->read_roots entry (and refuses more than
+ * HC_EXEC_MAX_READ_ROOTS) with HC_EXEC_ERR_READ_ROOT, so a caller can name the root that failed. */
+int         hc_exec_read_root_valid(const char *path);
+char       *hc_exec_read_root_canonical(const char *path);
+const char *hc_exec_read_root_problem(const char *path, const char *workspace);
 
 /* Free the heap members of a result (NULL-safe; idempotent — zeroes the freed pointer). */
 void hc_exec_result_free(hc_exec_result *);

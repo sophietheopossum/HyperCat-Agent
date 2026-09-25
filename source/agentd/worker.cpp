@@ -87,6 +87,7 @@ struct TaskCtx {
     std::string role_prompt;
     RoleToolset toolset;
     bool        exec_enabled = false; /* W4.3: register the host-gated `run` exec tool */
+    std::vector<std::string> exec_read_roots; /* named in the run tool's description (the host enforces them) */
     std::string skills_catalog;       /* W6 P6.2: the host-built fenced catalog, appended after the role overlay */
     hc_sandbox *skills_sb = nullptr;  /* W6 P6.2: the jailed skills/ root for the load_skill tool (null => off) */
 };
@@ -282,7 +283,8 @@ std::string run_agent_task(const TaskCtx &tc, const std::string &title, const st
     else if (deep_budget > 16) deep_budget = 16; /* clamp: cap the per-task deep_reason fan-out */
     ReasonToolCtx rzctx{&bus, tc.llm, deep_budget};
     MemToolCtx    memctx{&bus, corr};
-    RunToolCtx    runctx{&bus, corr}; /* W4.3: the host-gated exec tool (registered iff tc.exec_enabled) */
+    RunToolCtx    runctx{&bus, corr, run_tool_spec(tc.exec_read_roots)}; /* W4.3: the host-gated exec tool
+                                                                           (registered iff tc.exec_enabled) */
     SkillToolCtx  skillctx{tc.skills_sb}; /* W6 P6.2: load_skill reads from the jailed skills root (null => off) */
     register_agent_tools(ag, &fsctx, &rzctx, &memctx, tc.toolset, &runctx, tc.exec_enabled,
                          &skillctx); /* all ctxs alive across the run */
@@ -682,6 +684,7 @@ int run_worker(const WorkerConfig &cfg)
     tc.role_prompt = cfg.role_prompt;
     tc.toolset = parse_role_tools(cfg.role_tools);
     tc.exec_enabled = cfg.exec_enabled;
+    tc.exec_read_roots = cfg.exec_read_roots;
     tc.skills_catalog = cfg.skills_catalog; /* W6 P6.2: appended to the prompt; load_skill reads from skills_sb */
     tc.skills_sb = skills_sb;
 

@@ -158,7 +158,7 @@ struct Fleet::Impl {
     std::mutex              *roles_mu = nullptr; /* borrowed; guards *roles vs a runtime role edit (P2.3b). null => none */
     const Settings          *settings = nullptr; /* borrowed */
     FleetEnv                 env;
-    std::vector<std::string> llm_args;       /* the shared spawn args (--controller [+ --exec-enabled]) */
+    std::vector<std::string> llm_args;       /* the shared spawn args (--controller [+ --exec-enabled + --exec-read-root...]) */
     mutable std::mutex       mu;             /* guards roster */
     std::vector<WorkerDef>   roster;         /* guarded by mu */
     std::function<void(const std::vector<std::string> &)> on_change; /* set once at startup; fired on add/remove */
@@ -199,7 +199,14 @@ std::unique_ptr<Fleet> Fleet::create(hc::Supervisor *sup, const RoleTable *roles
     im->llm_args = {"--controller", "orchestrator"};
     /* W4.3: register the `run` exec tool on the workers ONLY when the operator has a non-empty exec allowlist;
      * the host's ExecGate re-validates + operator-gates every run (offline it auto-denies). */
-    if (!settings->exec_allow.empty()) im->llm_args.push_back("--exec-enabled");
+    if (!settings->exec_allow.empty()) {
+        im->llm_args.push_back("--exec-enabled");
+        /* the run jail's read folders, so the tool description can name them (the AuthGate enforces them) */
+        for (const auto &r : settings->exec_read_roots) {
+            im->llm_args.push_back("--exec-read-root");
+            im->llm_args.push_back(r);
+        }
+    }
 
     if (im->env.live) {
         im->env.ws_root = ws_root_raw;

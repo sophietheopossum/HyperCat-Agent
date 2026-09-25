@@ -749,12 +749,14 @@ void AuthGate::stop()
  * Called once at startup before the reader sees traffic, so exec_enabled_/exec_allow_ are set before any
  * tool.exec is validated. */
 void AuthGate::enable_exec(std::vector<std::string> allow, std::string ws_root, bool shared,
-                          std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn)
+                          std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn,
+                          std::vector<std::string> read_roots)
 {
     if (allow.empty()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         exec_allow_ = std::move(allow);
+        exec_read_roots_ = std::move(read_roots);
         ws_root_ = std::move(ws_root);
         shared_ws_ = shared;
         exec_enabled_ = true;
@@ -797,13 +799,29 @@ void AuthGate::exec_loop()
         spec.argv = cargv.data();
         spec.cwd = job.cwd.c_str();
         spec.max_output = kExecOutputCap;
+        /* the operator's read roots (set once before this thread started; read-only here -- no lock) */
+        std::vector<const char *> croots;
+        croots.reserve(exec_read_roots_.size() + 1);
+        for (auto &r : exec_read_roots_) croots.push_back(r.c_str());
+        croots.push_back(nullptr);
+        spec.read_roots = exec_read_roots_.empty() ? nullptr : croots.data();
         hc_exec_result res = {};
         hc_exec_status st = hc_exec_run(&spec, &res);
         std::string    body;
         if (st == HC_EXEC_OK)
             body = exec_reply_body(true, res.output ? std::string(res.output, res.output_len) : std::string(),
                                    res.exit_code, res.timed_out != 0);
-        else /* a host-side spawn/confine failure — nothing ran unconfined; deny with the reason */
+        else if (st == HC_EXEC_ERR_READ_ROOT) { /* name the root and why, so neither side guesses */
+            std::string why = "more run read folders than the jail accepts";
+            for (auto &r : exec_read_roots_)
+                if (const char *p = hc_exec_read_root_problem(r.c_str(), job.cwd.c_str())) {
+                    why = "run read folder " + r + " " + p;
+                    break;
+                }
+            body = exec_reply_body(false, "exec refused: " + why + " -- the operator can remove it or add it again "
+                                          "in Settings > RUN READ ACCESS",
+                                   -1, false);
+        } else /* a host-side spawn/confine failure — nothing ran unconfined; deny with the reason */
             body = exec_reply_body(false, std::string("exec unavailable: ") + hc_exec_strerror(st), -1, false);
         hc_exec_result_free(&res);
         {

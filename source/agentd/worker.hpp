@@ -58,6 +58,9 @@ struct WorkerConfig {
      * run an allowlisted binary in the kernel jail. The host sets this iff the operator's exec allowlist is
      * non-empty; the worker still NEVER execve's (only the host does, after re-validating + the operator gate). */
     bool exec_enabled = false;
+    /* The operator's run read folders (--exec-read-root, repeatable): named in the run tool's description only.
+     * The host's jail enforces them; the worker cannot widen anything with this list. */
+    std::vector<std::string> exec_read_roots;
     /* If `model` is set AND OPENROUTER_API_KEY is in the env, a task.assign runs a REAL hc_agent
      * turn against that model (key read from env, never argv); otherwise the task action is a
      * deterministic offline echo (so the gates stay key-free). base_url defaults to OpenRouter. */

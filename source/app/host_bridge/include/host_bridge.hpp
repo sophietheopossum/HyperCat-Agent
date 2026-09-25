@@ -247,9 +247,14 @@ public:
      * P06 (Wave 5) — `role_exec_allow_fn` (optional) resolves the requesting agent's PER-ROLE exec allowlist
      * (the host RoleTable, via the fleet roster). When it returns a non-empty list, the effective allowlist is
      * the INTERSECTION of the global `allow` and the role's — a role can only SUBTRACT commands, never widen.
-     * An empty/absent result inherits the global allowlist (today's behaviour). Set once with the gate config. */
+     * An empty/absent result inherits the global allowlist (today's behaviour). Set once with the gate config.
+     * `read_roots` (optional) are the operator's extra READ-ONLY subtrees handed to every run's jail
+     * (hc_exec_spec.read_roots), stored canonical: readable outside the workspace, never writable or executable.
+     * hc_exec vets them again per run and refuses the run if any no longer resolves to itself; the reply then
+     * names that root (hc_exec_read_root_problem). */
     void           enable_exec(std::vector<std::string> allow, std::string ws_root, bool shared,
-                               std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn = {});
+                               std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn = {},
+                               std::vector<std::string> read_roots = {});
     void           stop();                               /* idempotent; unblocks + joins the reader + exec thread */
     /* W2 P2.3: track the LIVE fleet (the host pushes fleet.ids() on add/remove). Only tool.authorize reqs from a
      * currently-live worker raise an operator prompt — a removed / never-spawned id can't forge one. */
@@ -279,6 +284,9 @@ private:
     /* the exec config (set once by enable_exec) + the exec-worker thread that runs APPROVED commands. */
     bool                                          exec_enabled_ = false;
     std::vector<std::string>                      exec_allow_; /* the operator's allowlist (absolute paths) */
+    /* the operator's read roots for every run's jail. Published ONCE under mu_ in enable_exec, before the exec
+     * thread is created, then read-only -- so exec_loop reads it without a lock, exactly like exec_allow_. */
+    std::vector<std::string>                      exec_read_roots_;
     /* P06: resolve a requesting agent's PER-ROLE exec allowlist (host RoleTable, via the fleet roster). Published
      * ONCE under mu_ in enable_exec (exactly like exec_allow_), before the exec thread / any traffic, then
      * read-only — so the reader calls it WITHOUT a lock (it does its OWN internal locking on the fleet + role

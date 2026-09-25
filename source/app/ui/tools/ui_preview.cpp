@@ -378,6 +378,7 @@ int main(int argc, char **argv)
         us.ov_model = true; /* show an env-locked field disabled */
         us.egress_allow = {"192.168.1.50"};
         us.exec_allow = {"/usr/bin/pytest", "/usr/bin/git"}; /* W4: the run allowlist editor populated */
+        us.exec_read_roots = {"/home/you/src"};               /* the run read-access editor populated */
         app->apply_settings(us); /* draft-read fields; the persona is seeded on the snapshot above (live-owned) */
         app->pin_window("Settings");
     }

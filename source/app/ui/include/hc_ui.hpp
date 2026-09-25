@@ -225,6 +225,7 @@ struct UiSettings {
     /* security */
     std::vector<std::string> egress_allow;             /* the E2 editor's list (numeric IPs)        */
     std::vector<std::string> exec_allow;               /* the exec allowlist (absolute paths; W4)   */
+    std::vector<std::string> exec_read_roots;          /* the run jail's extra READ-ONLY roots      */
     bool                     key_present = false;        /* hc_secrets holds the provider key          */
     bool                     keychain_available = false; /* an OS keychain is reachable (persist works) */
     bool                     export_key_to_env = false;  /* SECURITY: re-expose key to worker env (OFF) */
@@ -480,6 +481,9 @@ struct UiCommand {
                         * persists immediately). Add is confirm-gated in the UI; remove narrows (no confirm). */
         EditExecAllowlist, /* a: an absolute binary path, b: "add"|"remove" — the exec allowlist (W4; host
                             * re-validates [absolute + exists] + persists immediately; mirrors EditAllowlist). */
+        EditExecReadRoots, /* a: an absolute path, b: "add"|"remove" — the run jail's read-only roots (host
+                            * re-validates with the jail's own rule + persists immediately; mirrors
+                            * EditExecAllowlist). Add is confirm-gated in the UI; remove narrows (no confirm). */
         ConductorSay,  /* a: the line the operator typed in the conductor chat panel -> Conductor::say(a) */
         ConductorStopTurn, /* interrupt the in-flight conductor turn -> Conductor::cancel_turn() (keeps the session) */
         ConductorAttach,   /* a: ws-relative path, n: 0 = jailed workspace file — queue it for the next chat message (A) */

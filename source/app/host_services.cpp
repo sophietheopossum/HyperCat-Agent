@@ -306,6 +306,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
          * stale draft from [Apply] must NOT clobber it — preserve the authoritative list across the map. */
         std::vector<std::string> preserved_egress = settings->settings.egress_allow;
         std::vector<std::string> preserved_exec = settings->settings.exec_allow; /* W4: live-owned by EditExecAllowlist */
+        std::vector<std::string> preserved_read_roots = settings->settings.exec_read_roots; /* live-owned by EditExecReadRoots */
         auto                     preserved_roles = settings->settings.role_models; /* W2: live-owned by AssignRoleModel */
         /* the audio settings are LIVE-owned by the Music Player panel (its volume slider + the mood/spectrum
          * toggles persist them), NOT the Settings panel — preserve them so an [Apply] here can't reset them. */
@@ -325,6 +326,7 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         settings->settings = from_ui_settings(c.settings);
         settings->settings.egress_allow = std::move(preserved_egress);
         settings->settings.exec_allow = std::move(preserved_exec);
+        settings->settings.exec_read_roots = std::move(preserved_read_roots);
         settings->settings.role_models = std::move(preserved_roles);
         settings->settings.conductor_mood_enabled = preserved_mood;
         settings->settings.audio_volume = preserved_vol;
@@ -371,6 +373,26 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
         bool ok = settings_save(settings->settings, settings->path.c_str());
         return ok ? (add ? "exec allowlist entry added" : "exec allowlist entry removed")
                   : "exec edit save FAILED";
+    }
+    case hc::ui::UiCommand::Kind::EditExecReadRoots: {
+        /* security-WEAKENING (confirm-gated in the UI): add/remove ONE read-only root for the run tool's jail,
+         * persisted immediately. The host RE-VALIDATES (the UI is untrusted) with the jail's own rule, via
+         * hc::exec_read_root_edit -> hc_exec_read_root_canonical, and stores the RESOLVED path: it must exist,
+         * be a folder or a regular file, and not be the whole filesystem or reach /proc, /dev or /sys once
+         * symlinks resolve. The gate is configured once per project session, so a change -- adding OR removing
+         * -- takes effect when the project is re-opened. */
+        if (!settings) return "";
+        const bool  add = (c.b == "add");
+        std::string stored;
+        if (!hc::exec_read_root_edit(settings->settings.exec_read_roots, c.a.c_str(), add, &stored))
+            return add ? "read root rejected (must exist as a folder or regular file; absolute; not /, /proc, "
+                         "/dev or /sys even through a symlink; not already listed; under the cap)"
+                       : "read root not found";
+        settings_validate(settings->settings);
+        bool ok = settings_save(settings->settings, settings->path.c_str());
+        if (!ok) return "read root save FAILED";
+        return add ? "run read root added: " + stored + " (re-open the project to apply)"
+                   : std::string("run read root removed (re-open the project to apply)");
     }
     case hc::ui::UiCommand::Kind::AssignRoleModel: {
         /* W2: assign (or clear, when b is empty) which model a role runs, persisted IMMEDIATELY — the
@@ -1262,6 +1284,7 @@ Settings from_ui_settings(const hc::ui::UiSettings &u)
     s.task_deadline_ms = u.task_deadline_ms;
     s.egress_allow = u.egress_allow;
     s.exec_allow = u.exec_allow;
+    s.exec_read_roots = u.exec_read_roots;
     s.auto_approve_contained = u.auto_approve_contained; /* B3 */
     s.allow_all_approvals = u.allow_all_approvals;       /* B4 */
     /* models (W2): the UI catalog -> the settings catalog; the assignment grid (vector of pairs) -> the map. */
@@ -1711,6 +1734,7 @@ hc::ui::UiSettings to_ui_settings(const SettingsState &st)
     u.task_deadline_ms = s.task_deadline_ms;
     u.egress_allow = s.egress_allow;
     u.exec_allow = s.exec_allow;
+    u.exec_read_roots = s.exec_read_roots;
     u.auto_approve_contained = s.auto_approve_contained; /* B3 */
     u.allow_all_approvals = s.allow_all_approvals;       /* B4 */
     /* models (W2): the settings catalog -> the UI catalog; the role->model map -> the assignment grid (pairs). */

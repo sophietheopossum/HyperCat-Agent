@@ -12,6 +12,7 @@
 #include "hc_json.h"
 #include "ws_util.hpp" /* W4.3: ws_subdir — the agent's workspace dir (the exec cwd) */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -31,6 +32,7 @@ using hc::Message;
 using hc::host::AuthGate;
 using hc::host::CapabilityAuthority;
 using hc::host::PendingAuthView;
+using hc::host::SessionReadGrant;
 using hc::host::UiAdapter;
 
 /* a cap.check request body {"cmd":"cap.check","token":..,"verb":N,"path":..} (P09.2) */

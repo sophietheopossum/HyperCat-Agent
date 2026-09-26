@@ -20,6 +20,7 @@
 #include "prompt_defang.hpp" /* W6 P6.2: the shared pure defang the memory fence + the skills path both use */
 #include "ws_util.hpp" /* W4.3: ws_subdir — resolve a requesting agent's workspace as the exec cwd (1 source) */
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,7 @@ namespace {
 constexpr size_t kSummaryCap = 4096;
 constexpr size_t kMaxPending = 256;
 constexpr size_t kPathCap = 1024;
+constexpr size_t kReasonCap = 512; /* a request_read_access reason (model-written, shown to the operator) */
 constexpr size_t kContentCap = 256u * 1024; /* == the worker's kFsWriteMaxBytes; defensive re-bound */
 
 /* Pull a string field from a JSON object body; empty when absent/malformed. */
@@ -81,6 +83,66 @@ std::string verdict_body(bool approved)
 
 /* B1: the DISMISS reply — not approved, but flagged so the worker returns "deferred" (the operator set it aside),
  * NOT "denied". {"ok":true,"approved":false,"dismissed":true}. */
+/* The reply to a request_read_access ask: approved + the canonical path granted (or asked about) + a note the
+ * worker hands the model verbatim (why not, or that it was already readable). */
+std::string read_access_reply_body(bool approved, const std::string &path, const std::string &note)
+{
+    hc_json *o = hc_json_new_object();
+    if (!o) return "{\"ok\":true,\"approved\":false}";
+    hc_json_obj_set_bool(o, "ok", true);
+    hc_json_obj_set_bool(o, "approved", approved);
+    hc_json_obj_set_str(o, "path", path.c_str());
+    hc_json_obj_set_str(o, "note", note.c_str());
+    char       *out = hc_json_print(o, false);
+    hc_json_free(o);
+    std::string r = out ? out : "";
+    free(out);
+    return r;
+}
+
+/* `s` for display in a prompt: every control character, C1 control, line/paragraph separator and bidi override
+ * becomes a visible \xNN / \u{NNNN} escape, so model-written text (a reason, a path) can never start a new line
+ * or reorder the host-written lines around it. */
+std::string display_escaped(const std::string &s)
+{
+    std::string out;
+    char        b[16];
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f) {
+            snprintf(b, sizeof b, "\\x%02x", c);
+            out += b;
+            continue;
+        }
+        unsigned cp = 0;
+        size_t   len = 0;
+        if (c == 0xc2 && i + 1 < s.size()) { /* U+0080..U+00BF: the C1 controls are U+0080..U+009F */
+            cp = 0x80 + ((unsigned char)s[i + 1] & 0x3f);
+            len = 2;
+            if (cp > 0x9f) len = 0;
+        } else if (c == 0xe2 && i + 2 < s.size()) {
+            cp = ((c & 0x0f) << 12) | (((unsigned char)s[i + 1] & 0x3f) << 6) | ((unsigned char)s[i + 2] & 0x3f);
+            bool bad = cp == 0x200e || cp == 0x200f || (cp >= 0x2028 && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069);
+            len = bad ? 3 : 0;
+        }
+        if (len) {
+            snprintf(b, sizeof b, "\\u{%04x}", cp);
+            out += b;
+            i += len - 1;
+            continue;
+        }
+        out += (char)c;
+    }
+    return out;
+}
+
+/* 1 if `p` is `dir` or lies beneath it (both canonical). A file root covers only itself. */
+bool path_within(const std::string &p, const std::string &dir)
+{
+    if (dir == "/") return true;
+    return p.compare(0, dir.size(), dir) == 0 && (p.size() == dir.size() || p[dir.size()] == '/');
+}
+
 std::string dismiss_body()
 {
     hc_json *o = hc_json_new_object();

@@ -145,6 +145,18 @@ struct AuthRequest {
     bool                     is_exec = false;
     std::vector<std::string> argv;
     std::string              cwd; /* the requesting agent's workspace jail (== where hc_exec confines) */
+    /* A `request_read_access` ask: approving grants `read_root` -- the HOST-resolved canonical path the operator
+     * saw, never the worker's spelling -- to this agent's run jail until the project closes. `epoch` is the
+     * requesting worker instance: a grant lands only if the same instance still holds the id. */
+    bool        is_read_access = false;
+    std::string read_root;
+    uint64_t    epoch = 0;
+};
+
+/* One read folder granted to one agent's run jail for this session (by an approved request_read_access). */
+struct SessionReadGrant {
+    std::string agent;
+    std::string path;
 };
 
 /* What resolve() hands back after a verdict — enough for the host to record an approved fs_write as an
@@ -156,6 +168,7 @@ struct AuthResolution {
     std::string tool;    /* the tool name ("fs_write")                   */
     std::string path;    /* the write target (the artifact label)        */
     std::string content; /* the approved bytes (to put into the CAS)     */
+    std::string note;    /* read_access: what the worker was told (an Allow can still be refused: replaced, cap) */
 };
 
 /* The host-facing view of a pending request (no routing internals). main.cpp maps this into the UI
@@ -263,9 +276,21 @@ public:
      * traffic (read-only after). Null (the default) => a scoped grant degrades to a plain one-shot allow. */
     void           set_cap_authority(CapabilityAuthority *ca);
 
+    /* The read folders granted by approved request_read_access asks, per agent (for the Settings list), and
+     * revoking one. A revoke applies from that agent's next run. Thread-safe. */
+    void session_read_grants(std::vector<SessionReadGrant> &out);
+    bool revoke_session_read_grant(const std::string &agent, const std::string &path);
+    /* Drop everything bound to a worker that is leaving: its read grants, remembered declines and waiting read
+     * prompts. The fleet calls this BEFORE the id returns to its pool, so a worker that later gets the same id
+     * inherits none of it (set_known_agents does the same for ids that disappear from the fleet). */
+    void forget_agent(const std::string &agent);
+
 private:
     void reader_loop();
     void exec_loop(); /* W4.3: the exec-worker thread — runs APPROVED commands (hc_exec) off the reader/UI threads */
+    /* the reader's exec.read_access branch (from = the broker-stamped agent id, body = the request JSON) */
+    void read_access_request(const std::string &from, uint64_t corr, const std::string &body);
+    void forget_agent_locked(const std::string &agent); /* forget_agent's body; mu_ held */
 
     BusClient                                    *bus_ = nullptr;
     std::thread                                   reader_;
@@ -284,9 +309,20 @@ private:
     /* the exec config (set once by enable_exec) + the exec-worker thread that runs APPROVED commands. */
     bool                                          exec_enabled_ = false;
     std::vector<std::string>                      exec_allow_; /* the operator's allowlist (absolute paths) */
-    /* the operator's read roots for every run's jail. Published ONCE under mu_ in enable_exec, before the exec
-     * thread is created, then read-only -- so exec_loop reads it without a lock, exactly like exec_allow_. */
+    /* the operator's read roots for every run's jail (Settings). Published ONCE under mu_ in enable_exec, before
+     * the exec thread is created, then read-only. */
     std::vector<std::string>                      exec_read_roots_;
+    /* agent id -> read roots granted to THAT agent's runs for this session (approved request_read_access asks).
+     * Guarded by mu_: the reader (asks), resolve() (grants), the UI (revokes) and exec_loop (runs) all touch it. */
+    std::unordered_map<std::string, std::vector<std::string>> session_read_roots_;
+    /* agent id -> canonical paths the operator DECLINED for it (a later ask for the same path, or one inside or
+     * containing it, is refused without a new prompt). Guarded by mu_; cleared with the agent. */
+    std::unordered_map<std::string, std::vector<std::string>> declined_read_roots_;
+    /* mu_-guarded mirror of known_agents_ (so grants can be checked against it without nesting known_mu_), and a
+     * per-id epoch that moves on every time an id leaves: a pending read prompt carries the epoch it was asked
+     * under, and an approval grants nothing if the id has since changed hands. */
+    std::unordered_set<std::string>              live_agents_;
+    std::unordered_map<std::string, uint64_t>    agent_epoch_;
     /* P06: resolve a requesting agent's PER-ROLE exec allowlist (host RoleTable, via the fleet roster). Published
      * ONCE under mu_ in enable_exec (exactly like exec_allow_), before the exec thread / any traffic, then
      * read-only — so the reader calls it WITHOUT a lock (it does its OWN internal locking on the fleet + role

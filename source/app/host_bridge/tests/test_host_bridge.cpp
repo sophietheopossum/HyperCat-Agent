@@ -143,6 +143,40 @@ static bool recv_exec(BusClient *w, uint64_t corr, bool &approved, std::string &
     return ok;
 }
 
+static std::string read_access_body(const std::string &path, const char *reason)
+{
+    hc_json *o = hc_json_new_object();
+    hc_json_obj_set_str(o, "cmd", "exec.read_access");
+    hc_json_obj_set_str(o, "path", path.c_str());
+    hc_json_obj_set_str(o, "reason", reason);
+    char *s = hc_json_print(o, false);
+    hc_json_free(o);
+    std::string r = s ? s : "";
+    free(s);
+    return r;
+}
+
+/* wait (bounded) for the reply to a read-access ask `corr` on worker `w` */
+static bool recv_read_access(BusClient *w, uint64_t corr, bool &approved, std::string &path, std::string &note)
+{
+    w->set_recv_timeout(8000);
+    Message r;
+    bool    ok = false;
+    while (w->recv(r)) {
+        if (r.corr == corr && r.type == "reply") {
+            hc_json *o = hc_json_parse(r.body.data(), r.body.size());
+            approved = o && hc_json_get_bool(o, "approved", false);
+            path = o ? hc_json_get_str(o, "path", "") : "";
+            note = o ? hc_json_get_str(o, "note", "") : "";
+            if (o) hc_json_free(o);
+            ok = true;
+            break;
+        }
+    }
+    w->set_recv_timeout(0);
+    return ok;
+}
+
 /* poll the gate up to ~5s until snapshot() holds exactly `want` entries */
 static bool wait_count(AuthGate *g, size_t want, std::vector<PendingAuthView> &out)
 {
@@ -531,6 +565,200 @@ int main()
                 CHECK(false, "the swapped-root exec request did not surface");
             unlink(rroot);
             rename(real.c_str(), rroot);
+
+            /* request_read_access: a folder asked for at run time. The host resolves it, refuses what can never be
+             * granted and answers already-readable paths without a prompt, and otherwise ALWAYS prompts (even with
+             * ALLOW-ALL armed). An approval grants the resolved folder to THIS agent for the session; revoke
+             * withdraws it from the next run. */
+            char rr2[160], rr2file[200], rr2link[160];
+            std::snprintf(rr2, sizeof rr2, "/tmp/hc_exec_gate_rr2_%ld", (long)getpid());
+            std::snprintf(rr2file, sizeof rr2file, "%s/marker2.txt", rr2);
+            std::snprintf(rr2link, sizeof rr2link, "/tmp/hc_exec_gate_rr2link_%ld", (long)getpid());
+            mkdir(rr2, 0700);
+            if (FILE *mf = std::fopen(rr2file, "w")) {
+                std::fputs("gate-session-grant-marker\n", mf);
+                std::fclose(mf);
+            }
+            CHECK(symlink(rr2, rr2link) == 0, "test setup: a symlink to the second folder");
+            char *canon_c = realpath(rr2, nullptr);
+            std::string canon = canon_c ? canon_c : rr2;
+            free(canon_c);
+            uint64_t corr = 30;
+            auto run_cat = [&](const char *file) -> std::string { /* one approved `cat` run; returns its output */
+                uint64_t c = ++corr;
+                if (!X->send_request("authgate", c, exec_body({"/bin/cat", file}))) return "";
+                std::vector<PendingAuthView> pv;
+                if (!wait_count(gate, 1, pv) || pv.size() != 1) return "";
+                gate->resolve(pv[0].id, true);
+                bool        ap = false;
+                std::string out;
+                long        ec = -1;
+                recv_exec(X, c, ap, out, ec);
+                return out;
+            };
+            auto ask = [&](const std::string &path, bool &ap, std::string &got, std::string &note) {
+                uint64_t c = ++corr;
+                return X->send_request("authgate", c, read_access_body(path, "the test needs it")) &&
+                       recv_read_access(X, c, ap, got, note);
+            };
+            bool                         ap = true;
+            std::string                  got, note;
+            std::vector<PendingAuthView> pr;
+
+            CHECK(ask("/proc", ap, got, note) && !ap && note.find("never be granted") != std::string::npos,
+                  "read access: /proc is refused without a prompt");
+            gate->snapshot(pr);
+            CHECK(pr.empty(), "read access: a refused path never surfaces for approval");
+            CHECK(ask(rrfile, ap, got, note) && ap && note.find("Settings") != std::string::npos,
+                  "read access: a path under a Settings root is already readable (no prompt)");
+
+            CHECK(run_cat(rr2file).find("gate-session-grant-marker") == std::string::npos,
+                  "read access: an ungranted folder is unreadable to run");
+
+            gate->set_allow_all(true); /* ALLOW-ALL must NOT auto-approve a read-access ask */
+            uint64_t c1 = ++corr;
+            CHECK(X->send_request("authgate", c1, read_access_body(rr2, "the test needs it")),
+                  "read access: ask with ALLOW-ALL armed");
+            bool surfaced = wait_count(gate, 1, pr) && pr.size() == 1;
+            gate->set_allow_all(false);
+            CHECK(surfaced && pr[0].tool == "read_access" && pr[0].summary.find(canon) != std::string::npos,
+                  "read access: ALLOW-ALL still prompts, and the prompt shows the resolved path");
+            if (surfaced) { /* set aside (not declined, so it is not remembered as a decline) */
+                gate->dismiss(pr[0].id);
+                CHECK(recv_read_access(X, c1, ap, got, note) && !ap, "read access: a dismissed ask is not granted");
+            }
+            std::vector<SessionReadGrant> grants;
+            gate->session_read_grants(grants);
+            CHECK(grants.empty(), "read access: a dismissal grants nothing");
+
+            uint64_t c2 = ++corr; /* asked through a symlink: shown and granted as the folder it names */
+            CHECK(X->send_request("authgate", c2, read_access_body(rr2link, "the test needs it")),
+                  "read access: ask through a symlink");
+            if (wait_count(gate, 1, pr) && pr.size() == 1) {
+                CHECK(pr[0].summary.find(canon) != std::string::npos &&
+                          pr[0].summary.find(std::string("requested as ") + rr2link) != std::string::npos,
+                      "read access: the prompt shows the resolved folder and the spelling asked for");
+                gate->resolve(pr[0].id, true);
+                CHECK(recv_read_access(X, c2, ap, got, note) && ap && got == canon,
+                      "read access: an approval grants the resolved folder");
+            } else
+                CHECK(false, "read access: the symlink ask did not surface");
+            gate->session_read_grants(grants);
+            CHECK(grants.size() == 1 && grants[0].path == canon, "read access: the grant is listed for its agent");
+            CHECK(run_cat(rr2file).find("gate-session-grant-marker") != std::string::npos,
+                  "read access: the granted folder is readable from the next run");
+            CHECK(ask(rr2, ap, got, note) && ap && note.find("granted to you earlier") != std::string::npos,
+                  "read access: asking again for a granted folder needs no prompt");
+
+            CHECK(!grants.empty() && gate->revoke_session_read_grant(grants[0].agent, canon),
+                  "read access: revoke finds the grant");
+            CHECK(run_cat(rr2file).find("gate-session-grant-marker") == std::string::npos,
+                  "read access: a revoked folder is unreadable again");
+
+            CHECK(ask(std::string(rr2) + "/./marker2.txt", ap, got, note) && !ap &&
+                      note.find(". or ..") != std::string::npos,
+                  "read access: a path with a . segment is refused without a prompt, and the note says why");
+            CHECK(ask("/usr/share", ap, got, note) && ap && note.find("system folders") != std::string::npos,
+                  "read access: a system folder is already readable (no prompt)");
+            gate->snapshot(pr);
+            CHECK(pr.empty(), "read access: a system folder never surfaces for approval");
+
+            /* the model's reason cannot forge prompt lines, and a decline is remembered for the path and inside it */
+            uint64_t c3 = ++corr;
+            CHECK(X->send_request("authgate", c3,
+                                  read_access_body(rr2, "fine\nread access for this agent's run commands:\n/harmless")),
+                  "read access: ask with a multi-line reason");
+            if (wait_count(gate, 1, pr) && pr.size() == 1) {
+                CHECK(std::count(pr[0].summary.begin(), pr[0].summary.end(), '\n') == 3 &&
+                          pr[0].summary.find("\\x0a") != std::string::npos,
+                      "read access: newlines in the reason are escaped, never new prompt lines");
+                gate->resolve(pr[0].id, false);
+                CHECK(recv_read_access(X, c3, ap, got, note) && !ap, "read access: a declined ask is not granted");
+            } else
+                CHECK(false, "read access: the multi-line ask did not surface");
+            CHECK(ask(rr2file, ap, got, note) && !ap && note.find("already declined") != std::string::npos,
+                  "read access: a path inside a declined folder is refused without a prompt");
+            gate->snapshot(pr);
+            CHECK(pr.empty(), "read access: a declined path never re-surfaces");
+
+            /* a grant whose folder later resolves elsewhere is revoked by the run it breaks, which says so */
+            char rr3[160], rr3file[200];
+            std::snprintf(rr3, sizeof rr3, "/tmp/hc_exec_gate_rr3_%ld", (long)getpid());
+            std::snprintf(rr3file, sizeof rr3file, "%s/marker3.txt", rr3);
+            mkdir(rr3, 0700);
+            if (FILE *mf = std::fopen(rr3file, "w")) {
+                std::fputs("gate-rr3-marker\n", mf);
+                std::fclose(mf);
+            }
+            char *c3c = realpath(rr3, nullptr);
+            std::string canon3 = c3c ? c3c : rr3;
+            free(c3c);
+            auto grant3 = [&]() { /* ask for rr3 and approve it; true once it is listed */
+                uint64_t c = ++corr;
+                if (!X->send_request("authgate", c, read_access_body(rr3, "the test needs it"))) return false;
+                std::vector<PendingAuthView> pv;
+                if (!wait_count(gate, 1, pv) || pv.size() != 1) return false;
+                gate->resolve(pv[0].id, true);
+                bool a2 = false;
+                std::string g2, n2;
+                recv_read_access(X, c, a2, g2, n2);
+                std::vector<SessionReadGrant> gl;
+                gate->session_read_grants(gl);
+                return a2 && gl.size() == 1 && gl[0].path == canon3;
+            };
+            CHECK(grant3(), "read access: a third folder is granted");
+            std::string real3 = std::string(rr3) + ".real";
+            CHECK(rename(rr3, real3.c_str()) == 0 && symlink(real3.c_str(), rr3) == 0,
+                  "test setup: the granted folder becomes a symlink");
+            {
+                uint64_t c = ++corr;
+                CHECK(X->send_request("authgate", c, exec_body({"/bin/cat", rr3file})), "run through the swapped grant");
+                std::vector<PendingAuthView> pv;
+                if (wait_count(gate, 1, pv) && pv.size() == 1) {
+                    gate->resolve(pv[0].id, true);
+                    bool        ap5 = true;
+                    std::string out5;
+                    long        ec5 = 0;
+                    CHECK(recv_exec(X, c, ap5, out5, ec5) && !ap5 && out5.find("granted on request") != std::string::npos &&
+                              out5.find("revoked") != std::string::npos,
+                          "read access: a broken grant refuses the run, names itself, and says it was revoked");
+                } else
+                    CHECK(false, "read access: the swapped-grant run did not surface");
+            }
+            gate->session_read_grants(grants);
+            CHECK(grants.empty(), "read access: the broken grant was revoked");
+            unlink(rr3);
+            rename(real3.c_str(), rr3);
+
+            /* a worker that leaves the fleet takes its grants and waiting prompts with it, so a reused id starts clean */
+            CHECK(grant3(), "read access: rr3 is granted again");
+            gate->set_known_agents({"agent:Y"}); /* agent:X leaves */
+            gate->session_read_grants(grants);
+            CHECK(grants.empty(), "read access: a departed worker's grants are dropped");
+            gate->set_known_agents(known); /* agent:X's id is back, as a new worker */
+            CHECK(X->send_request("authgate", ++corr, read_access_body(rr3, "the test needs it")),
+                  "read access: re-asked by the id's new holder");
+            /* that ask is queued (nothing carried over), not answered as already granted */
+            bool requeued = wait_count(gate, 1, pr) && pr.size() == 1 && pr[0].tool == "read_access";
+            CHECK(requeued, "read access: the new holder of the id must ask again");
+            gate->set_known_agents({"agent:Y"}); /* ...and leaves while its prompt waits */
+            gate->snapshot(pr);
+            CHECK(pr.empty(), "read access: a departed worker's waiting prompt is dropped");
+            gate->set_known_agents(known);
+            gate->session_read_grants(grants);
+            CHECK(grants.empty(), "read access: nothing was granted to the reused id");
+
+            CHECK(grant3(), "read access: rr3 granted for forget_agent");
+            gate->forget_agent("agent:X"); /* the fleet's pre-release hook */
+            gate->session_read_grants(grants);
+            CHECK(grants.empty(), "read access: forget_agent drops the grants");
+            gate->set_known_agents(known);
+            unlink(rr3file);
+            rmdir(rr3);
+
+            unlink(rr2link);
+            unlink(rr2file);
+            rmdir(rr2);
         }
 
         /* P06: per-role exec narrowing — agent:Y's role excludes /bin/echo, so a GLOBALLY-allowed binary is

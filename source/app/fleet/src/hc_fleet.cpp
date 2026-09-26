@@ -162,6 +162,7 @@ struct Fleet::Impl {
     mutable std::mutex       mu;             /* guards roster */
     std::vector<WorkerDef>   roster;         /* guarded by mu */
     std::function<void(const std::vector<std::string> &)> on_change; /* set once at startup; fired on add/remove */
+    std::function<void(const std::string &)>              on_remove; /* set once; fired before an id is released */
 };
 
 Fleet::Fleet() : p_(new Impl) {}
@@ -299,6 +300,9 @@ bool Fleet::remove_worker(const std::string &id)
      * concurrent pool()/roster() reader (the conductor) must not stall on it. reap is the authoritative
      * teardown (process + bus-id revoke); we drop the roster entry only once it succeeds. */
     if (!p_->sup->reap(id)) return false; /* the supervisor does not know the id */
+    /* while the id is still in the roster (so add_worker cannot hand it out yet): drop what was bound to this
+     * worker instance, so the id's next holder inherits none of it */
+    if (p_->on_remove) p_->on_remove(id);
     {
         std::lock_guard<std::mutex> lk(p_->mu);
         for (auto it = p_->roster.begin(); it != p_->roster.end(); ++it)
@@ -309,6 +313,11 @@ bool Fleet::remove_worker(const std::string &id)
     }
     if (p_->on_change) p_->on_change(ids()); /* refresh the bus known-fleet filters — OUTSIDE the roster lock */
     return true;
+}
+
+void Fleet::set_on_remove(std::function<void(const std::string &id)> cb)
+{
+    p_->on_remove = std::move(cb); /* set once at startup, like on_change -> read-only, no lock */
 }
 
 void Fleet::set_on_change(std::function<void(const std::vector<std::string> &)> cb)

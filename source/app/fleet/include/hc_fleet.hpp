@@ -128,6 +128,11 @@ public:
      * roster lock (the callback is thread-safe). Pass nullptr to clear (teardown does, before the adapters free). */
     void set_on_change(std::function<void(const std::vector<std::string> &ids)> cb);
 
+    /* Fired by remove_worker after the worker is reaped but BEFORE its id leaves the roster -- so add_worker cannot
+     * hand the id to a new worker until the callback has dropped whatever was bound to the old one (the AuthGate's
+     * read grants). Same rules as set_on_change: set once, outside the roster lock, nullptr clears. */
+    void set_on_remove(std::function<void(const std::string &id)> cb);
+
     /* W6 P6.2: set the per-project Skills passed to every worker spawned hereafter — the jailed skills/ dir
      * (load_skill reads bodies) + the host-built fenced catalog (appended to the prompt). Call ONCE at setup,
      * BEFORE any worker is spawned (read-only after; not synchronized — same single-threaded-setup contract as

@@ -131,6 +131,9 @@ hc_exec_status hc_exec_run(const hc_exec_spec *spec, hc_exec_result *out);
  * returned string is static. hc_exec_run applies this to every spec->read_roots entry (and refuses more than
  * HC_EXEC_MAX_READ_ROOTS) with HC_EXEC_ERR_READ_ROOT, so a caller can name the root that failed. */
 int         hc_exec_read_root_valid(const char *path);
+/* 1 if the canonical `path` lies in the system folders every run may read anyway (the loader's dirs and /etc),
+ * so granting it would change nothing. */
+int         hc_exec_read_default(const char *path);
 char       *hc_exec_read_root_canonical(const char *path);
 const char *hc_exec_read_root_problem(const char *path, const char *workspace);
 

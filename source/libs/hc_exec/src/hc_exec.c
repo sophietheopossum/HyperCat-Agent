@@ -99,6 +99,11 @@ static const long kDefNproc = 0, kDefNofile = 256;
 enum { kStageRlimit = 1, kStageChdir = 2, kStageNoNewPrivs = 3, kStageLandlock = 4, kStageSeccomp = 5,
        kStageExec = 6 };
 
+/* The system folders every run reads: the loader's (also EXECUTE) and /etc (read only). One list, used by the
+ * jail and by hc_exec_read_default. */
+static const char *const kSysDirs[] = {"/usr", "/lib", "/lib64", "/bin", "/sbin", NULL};
+static const char kEtcDir[] = "/etc";
+
 #ifdef HC_EXEC_LINUX
 
 /* resolved rlimits the child applies (defined before any use so it is one file-scope type, not a
@@ -196,7 +201,6 @@ static int apply_landlock(const char *cwd, const char *const *read_roots)
      * files like machine-id) — info disclosure within the same-uid trust boundary, not an escape; a tighter
      * per-file allowlist is deferred (it risks breaking NSS-using binaries). */
     const uint64_t sys_r = (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR) & handled;
-    static const char *const sysdirs[] = {"/usr", "/lib", "/lib64", "/bin", "/sbin", NULL};
     /* Workspace: read + write + create/remove — but deliberately NO EXECUTE, so a binary the child writes
      * into the workspace cannot then be run (a re-exec from here is denied at the Landlock layer; this is the
      * actual mechanism, since seccomp does NOT block execve). Rights are masked to `handled`. */
@@ -207,8 +211,8 @@ static int apply_landlock(const char *cwd, const char *const *read_roots)
                            handled;
 
     int rc = 0;
-    for (const char *const *d = sysdirs; *d && rc == 0; d++) rc = ll_allow(rs, *d, sys_rx);
-    if (rc == 0) rc = ll_allow(rs, "/etc", sys_r); /* config: read only */
+    for (const char *const *d = kSysDirs; *d && rc == 0; d++) rc = ll_allow(rs, *d, sys_rx);
+    if (rc == 0) rc = ll_allow(rs, kEtcDir, sys_r); /* config: read only */
     /* Operator-granted read roots: READ only, exactly like /etc. No execute, so a binary that happens to live
      * under a read root still cannot be run (only the system dirs above carry EXECUTE); no write, so the
      * workspace stays the ONLY writable subtree. Landlock grants are a union, so a root that contains the
@@ -495,6 +499,14 @@ static int has_dot_segment(const char *p)
 
 /* A root is a folder (read it and list beneath it) or one regular file. */
 static int grantable_kind(mode_t m) { return S_ISDIR(m) || S_ISREG(m); }
+
+int hc_exec_read_default(const char *path)
+{
+    if (!path) return 0;
+    for (const char *const *d = kSysDirs; *d; d++)
+        if (path_within(path, *d)) return 1;
+    return path_within(path, kEtcDir);
+}
 
 int hc_exec_read_root_valid(const char *path)
 {

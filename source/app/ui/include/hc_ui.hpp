@@ -363,6 +363,12 @@ struct AudioTrack {
     std::string fmt; /* "WAV"/"MP3"/"FLAC"/"OGG" */
 };
 
+/* One read folder granted to one agent's run jail for this session (an approved request_read_access). */
+struct SessionReadGrantRow {
+    std::string agent;
+    std::string path;
+};
+
 struct UiSnapshot {
     std::string              agenda_title;
     int                      agenda_progress = 0; /* 0..100 */
@@ -384,6 +390,7 @@ struct UiSnapshot {
     bool                     third_party_tools_disabled = false; /* the global kill-switch state (host-owned)     */
     bool                     third_party_conductor = false; /* D4c: the conductor may use third-party tools (opt-in) */
     std::vector<PendingAuth> pending_auth; /* tool-auth requests awaiting a human allow/deny verdict   */
+    std::vector<SessionReadGrantRow> session_read_grants; /* run read folders granted this session on request */
     std::vector<Toast>       toasts;       /* B2: transient notification cards (approval-pending, etc.) */
     std::string              reasoning;    /* the latest deep_reason 5-stage chain (untrusted text)   */
     std::vector<FileEntry>   files;        /* the sandboxed workspace's contents (file browser; full ws-rel paths) */
@@ -469,6 +476,7 @@ struct UiCommand {
         CreateAgenda, /* a: title, b: goal, tasks: the user's tasks — submit a new agenda */
         ToolVerdict,  /* a: request id, n: 1=allow / 0=deny — a tool-auth verdict          */
         ToolDismiss,  /* a: request id — DEFER it (B1): clears the prompt without a verdict, NOT a denial   */
+        RevokeSessionReadGrant, /* a: agent id, b: path — withdraw a read folder granted this session on request */
         ToolGrantScoped, /* a: request id, n: budget — approve an fs_write AND mint a SCOPED capability for N
                           * prompt-free writes under the file's directory (P09.3; host derives the prefix)      */
         OpenSession,  /* a: session id — load a past session's transcript                 */

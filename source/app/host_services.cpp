@@ -245,12 +245,23 @@ std::string dispatch_ui_command(hc::ui::UiCommand &c, Orchestrator &orch, Superv
                 record_write_artifact(art, orch, r); /* an approved fs_write -> a content-addressed artifact */
             }
         }
+        if (r.tool == "read_access" && c.n != 0) /* an Allow can still be refused (worker replaced, limit reached) */
+            return r.approved ? "read access granted to " + r.agent + " until the project closes"
+                              : "read access NOT granted: " + r.note;
         return c.n != 0 ? "tool request allowed" : "tool request denied";
     }
     case hc::ui::UiCommand::Kind::ToolDismiss: {
         if (!gate) return "";
         gate->dismiss(c.a); /* B1: clear the prompt without a verdict — the worker gets "deferred", not "denied" */
         return "tool request deferred";
+    }
+    case hc::ui::UiCommand::Kind::RevokeSessionReadGrant: {
+        /* narrows only: withdraws a read folder an approved request_read_access granted to one agent; that
+         * agent's next run no longer gets it */
+        if (!gate) return "";
+        return gate->revoke_session_read_grant(c.a, c.b)
+                   ? "read access revoked: " + c.b + " (from " + c.a + "'s next command)"
+                   : std::string("read access grant not found");
     }
     case hc::ui::UiCommand::Kind::ToolGrantScoped: {
         /* P09.3: approve THIS fs_write AND mint a scoped capability for `c.n` prompt-free writes under the
@@ -2038,6 +2049,9 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
                                 hc::ui::Toast::Kind::AutoApproved};
                 toast_ring.emplace_back(t, 180); /* ~3s at 60fps */
             }
+            std::vector<hc::host::SessionReadGrant> grants;
+            svc.gate->session_read_grants(grants);
+            for (auto &g : grants) s.session_read_grants.push_back({std::move(g.agent), std::move(g.path)});
             std::vector<hc::host::PendingAuthView> pend;
             svc.gate->snapshot(pend);
             std::unordered_set<std::string> live;

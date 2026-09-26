@@ -396,7 +396,7 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
     ImGui::Spacing();
     PanelHeader("RUN READ ACCESS (advanced)");
     ImGui::TextColored(muted_v4(), "extra folders (or single files) a run may READ outside its workspace -- never write or execute.");
-    ImGui::TextColored(muted_v4(), "Changes apply when the project is re-opened.");
+    ImGui::TextColored(muted_v4(), "Changes to this list apply when the project is re-opened.");
     /* The LIVE list (EditExecReadRoots persists immediately, like the run allowlist above). Remove narrows;
      * Add WIDENS what can reach the model and is confirm-gated. The host re-validates with the jail's own rule. */
     for (size_t i = 0; i < live.exec_read_roots.size(); i++) {
@@ -408,6 +408,23 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
         ImGui::PopID();
     }
     if (live.exec_read_roots.empty()) ImGui::TextColored(muted_v4(), "(none — runs read only their workspace)");
+    /* granted on request (an approved request_read_access): one worker each, gone when the project closes or the
+     * worker leaves the fleet. Revoke narrows at once, from that agent's next command. */
+    if (!s.session_read_grants.empty()) {
+        ImGui::TextColored(muted_v4(), "granted on request, until the project closes (Revoke applies from that "
+                                       "agent's next command):");
+        for (size_t i = 0; i < s.session_read_grants.size(); i++) {
+            const auto &g = s.session_read_grants[i];
+            ImGui::PushID((int)(12000 + i));
+            ImGui::TextColored(accent_v4(), "%s", g.agent.c_str());
+            ImGui::SameLine();
+            ImGui::TextUnformatted(g.path.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Revoke"))
+                ctx.commands.push_back({UiCommand::Kind::RevokeSessionReadGrant, g.agent, g.path, 0, {}, {}});
+            ImGui::PopID();
+        }
+    }
 
     static char rrbuf[512] = {};
     static char rrpending[512] = {};

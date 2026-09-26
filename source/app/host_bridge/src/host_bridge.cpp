@@ -799,12 +799,22 @@ void AuthGate::exec_loop()
         spec.argv = cargv.data();
         spec.cwd = job.cwd.c_str();
         spec.max_output = kExecOutputCap;
-        /* the operator's read roots (set once before this thread started; read-only here -- no lock) */
+        /* the operator's read roots (Settings) + the ones granted to THIS agent this session, copied under the
+         * lock: a grant or revoke can land while the job waits */
+        std::vector<std::string> roots;
+        size_t                   n_settings = 0; /* roots[0, n_settings) are Settings roots; the rest were asked for */
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            roots = exec_read_roots_;
+            n_settings = roots.size();
+            auto sess = session_read_roots_.find(job.to);
+            if (sess != session_read_roots_.end()) roots.insert(roots.end(), sess->second.begin(), sess->second.end());
+        }
         std::vector<const char *> croots;
-        croots.reserve(exec_read_roots_.size() + 1);
-        for (auto &r : exec_read_roots_) croots.push_back(r.c_str());
+        croots.reserve(roots.size() + 1);
+        for (auto &r : roots) croots.push_back(r.c_str());
         croots.push_back(nullptr);
-        spec.read_roots = exec_read_roots_.empty() ? nullptr : croots.data();
+        spec.read_roots = roots.empty() ? nullptr : croots.data();
         hc_exec_result res = {};
         hc_exec_status st = hc_exec_run(&spec, &res);
         std::string    body;
@@ -813,14 +823,19 @@ void AuthGate::exec_loop()
                                    res.exit_code, res.timed_out != 0);
         else if (st == HC_EXEC_ERR_READ_ROOT) { /* name the root and why, so neither side guesses */
             std::string why = "more run read folders than the jail accepts";
-            for (auto &r : exec_read_roots_)
-                if (const char *p = hc_exec_read_root_problem(r.c_str(), job.cwd.c_str())) {
-                    why = "run read folder " + r + " " + p;
+            std::string fix = " -- the operator can remove it or add it again in Settings > RUN READ ACCESS";
+            for (size_t k = 0; k < roots.size(); k++)
+                if (const char *p = hc_exec_read_root_problem(roots[k].c_str(), job.cwd.c_str())) {
+                    why = "run read folder " + roots[k] + " " + p;
+                    if (k >= n_settings) { /* a grant this agent asked for: withdraw it so its next run works */
+                        revoke_session_read_grant(job.to, roots[k]);
+                        why = "run read folder " + roots[k] + " (granted on request) " + p;
+                        fix = " -- it has been revoked, so run the command again (and request it again if you "
+                              "still need it)";
+                    }
                     break;
                 }
-            body = exec_reply_body(false, "exec refused: " + why + " -- the operator can remove it or add it again "
-                                          "in Settings > RUN READ ACCESS",
-                                   -1, false);
+            body = exec_reply_body(false, "exec refused: " + why + fix, -1, false);
         } else /* a host-side spawn/confine failure — nothing ran unconfined; deny with the reason */
             body = exec_reply_body(false, std::string("exec unavailable: ") + hc_exec_strerror(st), -1, false);
         hc_exec_result_free(&res);

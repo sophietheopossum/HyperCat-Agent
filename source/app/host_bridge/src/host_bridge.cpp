@@ -20,6 +20,7 @@
 #include "prompt_defang.hpp" /* W6 P6.2: the shared pure defang the memory fence + the skills path both use */
 #include "ws_util.hpp" /* W4.3: ws_subdir — resolve a requesting agent's workspace as the exec cwd (1 source) */
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,7 @@ namespace {
 constexpr size_t kSummaryCap = 4096;
 constexpr size_t kMaxPending = 256;
 constexpr size_t kPathCap = 1024;
+constexpr size_t kReasonCap = 512; /* a request_read_access reason (model-written, shown to the operator) */
 constexpr size_t kContentCap = 256u * 1024; /* == the worker's kFsWriteMaxBytes; defensive re-bound */
 
 /* Pull a string field from a JSON object body; empty when absent/malformed. */
@@ -81,6 +83,66 @@ std::string verdict_body(bool approved)
 
 /* B1: the DISMISS reply — not approved, but flagged so the worker returns "deferred" (the operator set it aside),
  * NOT "denied". {"ok":true,"approved":false,"dismissed":true}. */
+/* The reply to a request_read_access ask: approved + the canonical path granted (or asked about) + a note the
+ * worker hands the model verbatim (why not, or that it was already readable). */
+std::string read_access_reply_body(bool approved, const std::string &path, const std::string &note)
+{
+    hc_json *o = hc_json_new_object();
+    if (!o) return "{\"ok\":true,\"approved\":false}";
+    hc_json_obj_set_bool(o, "ok", true);
+    hc_json_obj_set_bool(o, "approved", approved);
+    hc_json_obj_set_str(o, "path", path.c_str());
+    hc_json_obj_set_str(o, "note", note.c_str());
+    char       *out = hc_json_print(o, false);
+    hc_json_free(o);
+    std::string r = out ? out : "";
+    free(out);
+    return r;
+}
+
+/* `s` for display in a prompt: every control character, C1 control, line/paragraph separator and bidi override
+ * becomes a visible \xNN / \u{NNNN} escape, so model-written text (a reason, a path) can never start a new line
+ * or reorder the host-written lines around it. */
+std::string display_escaped(const std::string &s)
+{
+    std::string out;
+    char        b[16];
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f) {
+            snprintf(b, sizeof b, "\\x%02x", c);
+            out += b;
+            continue;
+        }
+        unsigned cp = 0;
+        size_t   len = 0;
+        if (c == 0xc2 && i + 1 < s.size()) { /* U+0080..U+00BF: the C1 controls are U+0080..U+009F */
+            cp = 0x80 + ((unsigned char)s[i + 1] & 0x3f);
+            len = 2;
+            if (cp > 0x9f) len = 0;
+        } else if (c == 0xe2 && i + 2 < s.size()) {
+            cp = ((c & 0x0f) << 12) | (((unsigned char)s[i + 1] & 0x3f) << 6) | ((unsigned char)s[i + 2] & 0x3f);
+            bool bad = cp == 0x200e || cp == 0x200f || (cp >= 0x2028 && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069);
+            len = bad ? 3 : 0;
+        }
+        if (len) {
+            snprintf(b, sizeof b, "\\u{%04x}", cp);
+            out += b;
+            i += len - 1;
+            continue;
+        }
+        out += (char)c;
+    }
+    return out;
+}
+
+/* 1 if `p` is `dir` or lies beneath it (both canonical). A file root covers only itself. */
+bool path_within(const std::string &p, const std::string &dir)
+{
+    if (dir == "/") return true;
+    return p.compare(0, dir.size(), dir) == 0 && (p.size() == dir.size() || p[dir.size()] == '/');
+}
+
 std::string dismiss_body()
 {
     hc_json *o = hc_json_new_object();
@@ -340,6 +402,7 @@ AuthGate *AuthGate::start(const std::string &sock, std::unordered_set<std::strin
     if (!b) return nullptr;
     AuthGate *g = new AuthGate();
     g->bus_ = b;
+    g->live_agents_ = known_agents;
     g->known_agents_ = std::move(known_agents);
 #ifdef HC_ENABLE_TEST_GATES
     const char *aa = getenv("HC_AUTO_APPROVE"); /* TEST-ONLY headless validation switch (default-off) */
@@ -356,8 +419,38 @@ AuthGate::~AuthGate() { stop(); }
 
 void AuthGate::set_known_agents(std::unordered_set<std::string> a)
 {
-    std::lock_guard<std::mutex> lk(known_mu_);
-    known_agents_ = std::move(a);
+    {
+        std::lock_guard<std::mutex> lk(known_mu_);
+        known_agents_ = a;
+    }
+    /* then, under mu_ alone (never nested with known_mu_): an id that left the fleet takes its read grants,
+     * declines and waiting read prompts with it */
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<std::string>    gone;
+    for (const auto &id : live_agents_)
+        if (!a.count(id)) gone.push_back(id);
+    for (const auto &kv : session_read_roots_)
+        if (!a.count(kv.first)) gone.push_back(kv.first);
+    for (const auto &id : gone) forget_agent_locked(id);
+    live_agents_ = std::move(a);
+}
+
+void AuthGate::forget_agent(const std::string &agent)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    forget_agent_locked(agent);
+    live_agents_.erase(agent);
+}
+
+void AuthGate::forget_agent_locked(const std::string &agent)
+{
+    session_read_roots_.erase(agent);
+    declined_read_roots_.erase(agent);
+    /* its waiting read and run prompts: nobody is left to answer, and an Allow must not reach the id's next holder */
+    for (auto it = pending_.begin(); it != pending_.end();)
+        it = ((it->second.is_read_access || it->second.is_exec) && it->second.agent == agent) ? pending_.erase(it)
+                                                                                                : std::next(it);
+    agent_epoch_[agent]++;
 }
 
 void AuthGate::reader_loop()
@@ -368,13 +461,19 @@ void AuthGate::reader_loop()
         if (m.type != "req") continue;
         std::string cmd = body_str(m.body, "cmd");
         bool        is_exec = (cmd == "tool.exec"); /* W4.3: the brokered `run` exec request */
-        if (cmd != "tool.authorize" && !is_exec) continue; /* no reply: not our protocol */
+        bool        is_read_access = (cmd == "exec.read_access"); /* a run jail read-folder ask */
+        if (cmd != "tool.authorize" && !is_exec && !is_read_access) continue; /* no reply: not our protocol */
         /* `m.from` is broker-stamped. Only KNOWN fleet agents may raise a prompt — a request from any
          * other id is dropped (an unconfirmed managed squatter cannot even route a req here; a generic
          * same-uid id is filtered out, so it cannot spoof a prompt). */
         {
             std::lock_guard<std::mutex> lk(known_mu_); /* the LIVE fleet (refreshed on add/remove worker) */
             if (known_agents_.find(m.from) == known_agents_.end()) continue;
+        }
+
+        if (is_read_access) {
+            read_access_request(m.from, m.corr, m.body);
+            continue;
         }
 
         if (is_exec) { /* ---- W4.3 exec: re-validate server-side, auto-deny pre-gate, else enqueue ---- */
@@ -571,13 +670,43 @@ AuthResolution AuthGate::resolve(const std::string &id, bool approved)
     AuthResolution r;
     std::string    to;
     uint64_t       corr = 0;
-    bool           in_host = false, is_exec = false;
+    bool           in_host = false, is_exec = false, is_read = false;
+    std::string    read_root, read_note;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto                        it = pending_.find(id);
         if (it == pending_.end()) return r; /* already resolved / aged out — nothing to reply to */
         in_host = it->second.in_host;
         is_exec = it->second.is_exec;
+        is_read = it->second.is_read_access;
+        read_root = it->second.read_root;
+        if (is_read) {
+            const std::string &agent = it->second.agent;
+            auto               ep = agent_epoch_.find(agent);
+            bool same_worker = live_agents_.count(agent) && (ep == agent_epoch_.end() ? 0 : ep->second) == it->second.epoch;
+            auto &granted = session_read_roots_[agent];
+            if (!same_worker) {
+                read_note = "the requesting worker was replaced, so nothing was granted";
+                approved = false;
+            } else if (!approved) {
+                declined_read_roots_[agent].push_back(read_root); /* not asked about again */
+                read_note = "the operator declined";
+            } else if (std::any_of(exec_read_roots_.begin(), exec_read_roots_.end(),
+                                   [&](const std::string &root) { return path_within(read_root, root); }) ||
+                       std::any_of(granted.begin(), granted.end(),
+                                   [&](const std::string &root) { return path_within(read_root, root); })) {
+                read_note = "already readable"; /* granted meanwhile (Settings, or a wider ask): no new slot */
+            } else if (exec_read_roots_.size() + granted.size() >= HC_EXEC_MAX_READ_ROOTS) {
+                read_note = "the read-folder limit is reached; the operator can free a slot by revoking a grant in "
+                            "Settings";
+                approved = false;
+            } else { /* grant the path the operator SAW, to this worker, until the project closes */
+                if (std::find(granted.begin(), granted.end(), read_root) == granted.end()) granted.push_back(read_root);
+                read_note = "granted until the project closes";
+            }
+            if (granted.empty()) session_read_roots_.erase(agent);
+            r.note = read_note;
+        }
         to = it->second.agent;
         corr = it->second.corr;
         r.approved = approved;
@@ -601,7 +730,10 @@ AuthResolution AuthGate::resolve(const std::string &id, bool approved)
      * signaled above (no bus target); an APPROVED exec is replied to by the exec thread (with its output). */
     if (!in_host && !(is_exec && approved)) {
         std::lock_guard<std::mutex> sl(send_mu_);
-        bus_->send_reply(to, corr, is_exec ? exec_reply_body(false, "", -1, false) : verdict_body(approved));
+        if (is_read)
+            bus_->send_reply(to, corr, read_access_reply_body(approved, read_root, read_note));
+        else
+            bus_->send_reply(to, corr, is_exec ? exec_reply_body(false, "", -1, false) : verdict_body(approved));
     }
     return r;
 }
@@ -631,6 +763,130 @@ void AuthGate::dismiss(const std::string &id)
         std::lock_guard<std::mutex> sl(send_mu_);
         bus_->send_reply(to, corr, dismiss_body());
     }
+}
+
+/* A worker asks for its `run` jail to READ a folder (or one file) outside its workspace. The host resolves the
+ * path itself -- the worker's spelling is untrusted, and a symlink must be judged, and shown, by what it names --
+ * with the jail's own rule; refuses what the jail could never grant, or what the operator already declined,
+ * without bothering them; answers at once when the path is already readable; and otherwise ALWAYS asks:
+ * ALLOW-ALL, auto mode and the test auto-approve deliberately never apply here, because this widens what the
+ * model can see. An approval (resolve) grants that canonical path to THIS worker instance until the project
+ * closes or the worker leaves the fleet (forget_agent). */
+void AuthGate::read_access_request(const std::string &from, uint64_t corr, const std::string &body)
+{
+    std::string asked = body_str(body, "path");
+    std::string reason = body_str(body, "reason");
+    if (asked.size() > kPathCap) asked.resize(kPathCap);
+    if (reason.size() > kReasonCap) reason.resize(kReasonCap);
+
+    std::string canon;
+    if (char *c = hc_exec_read_root_canonical(asked.c_str())) {
+        canon = c;
+        free(c);
+    }
+    bool        answer = true; /* reply now (true) or queue for the operator (false) */
+    bool        approved = false;
+    std::string note;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!live_agents_.count(from)) return; /* it left the fleet between the reader's check and here */
+        static const std::vector<std::string> kNone;
+        auto        own = session_read_roots_.find(from);
+        const auto &granted = own == session_read_roots_.end() ? kNone : own->second;
+        auto        dec = declined_read_roots_.find(from);
+        const auto &declined = dec == declined_read_roots_.end() ? kNone : dec->second;
+        auto        covered = [&](const std::vector<std::string> &roots) {
+            return std::any_of(roots.begin(), roots.end(), [&](const std::string &r) { return path_within(canon, r); });
+        };
+        std::string ws;
+        if (exec_enabled_) {
+            if (char *w = realpath((ws_root_ + "/" + hcapp::ws_subdir(from, shared_ws_)).c_str(), nullptr)) {
+                ws = w;
+                free(w);
+            }
+        }
+        if (!exec_enabled_) {
+            note = "the run tool is not enabled";
+        } else if (canon.empty()) {
+            note = "it can never be granted: use an absolute path, with no . or .. segments, to an existing folder or "
+                   "regular file; /, /proc, /dev and /sys are refused, even through a symlink";
+        } else if (hc_exec_read_default(canon.c_str())) {
+            approved = true;
+            note = "already readable: system folders are always readable";
+        } else if (covered(exec_read_roots_)) {
+            approved = true;
+            note = "already readable: the operator granted it in Settings";
+        } else if (covered(granted)) {
+            approved = true;
+            note = "already readable: granted to you earlier (it lasts until the project closes)";
+        } else if (!ws.empty() && path_within(canon, ws)) {
+            approved = true;
+            note = "already readable: it is inside your workspace";
+        } else if (std::any_of(declined.begin(), declined.end(), [&](const std::string &d) {
+                       return path_within(canon, d) || path_within(d, canon);
+                   })) {
+            note = "the operator already declined this path (or one inside or containing it); ask them directly if "
+                   "you still need it";
+        } else if (exec_read_roots_.size() + granted.size() +
+                       std::count_if(pending_.begin(), pending_.end(),
+                                     [&](const auto &kv) { return kv.second.is_read_access && kv.second.agent == from; }) >=
+                   HC_EXEC_MAX_READ_ROOTS) {
+            note = "the read-folder limit is reached; the operator can free a slot by revoking a grant in Settings";
+        } else if (pending_.size() >= kMaxPending) {
+            return; /* flood -> the worker times out (fail-closed), like every other gated request */
+        } else {
+            answer = false;
+            /* model-written parts (the spelling asked for, the reason) are escaped so they stay on their own line */
+            std::string summary = "read access for this agent's run commands, until the project is closed:\n" +
+                                  display_escaped(canon);
+            if (canon != asked) summary += "\n(requested as " + display_escaped(asked) + ")";
+            std::string why; /* escaped, then every run of spaces collapsed: no padding it onto a line of its own */
+            for (char ch : display_escaped(reason))
+                if (ch != ' ' || (!why.empty() && why.back() != ' ')) why += ch;
+            while (!why.empty() && why.back() == ' ') why.pop_back();
+            summary += "\nRead-only: never written or executed. Anything readable can reach the model in a "
+                       "command's output.\nagent's stated reason (unverified): \"" +
+                       why + "\"";
+            if (summary.size() > kSummaryCap) summary.resize(kSummaryCap);
+            AuthRequest rq{};
+            rq.agent = from;
+            rq.tool = "read_access";
+            rq.summary = std::move(summary);
+            rq.corr = corr;
+            rq.at = std::chrono::steady_clock::now();
+            rq.is_read_access = true;
+            rq.read_root = canon;
+            auto ep = agent_epoch_.find(from);
+            rq.epoch = ep == agent_epoch_.end() ? 0 : ep->second;
+            pending_.emplace("read-" + std::to_string(next_id_++), std::move(rq)); /* the worker blocks for it */
+        }
+    }
+    if (answer) {
+        std::lock_guard<std::mutex> sl(send_mu_);
+        bus_->send_reply(from, corr, read_access_reply_body(approved, canon, note));
+    }
+}
+
+void AuthGate::session_read_grants(std::vector<SessionReadGrant> &out)
+{
+    out.clear();
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto &kv : session_read_roots_)
+        for (const auto &path : kv.second) out.push_back({kv.first, path});
+    std::sort(out.begin(), out.end(), [](const SessionReadGrant &a, const SessionReadGrant &b) {
+        return a.agent != b.agent ? a.agent < b.agent : a.path < b.path;
+    });
+}
+
+bool AuthGate::revoke_session_read_grant(const std::string &agent, const std::string &path)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto                        it = session_read_roots_.find(agent);
+    if (it == session_read_roots_.end()) return false;
+    auto pos = std::find(it->second.begin(), it->second.end(), path);
+    if (pos == it->second.end()) return false;
+    it->second.erase(pos);
+    return true;
 }
 
 void AuthGate::set_auto_mode(bool on) { auto_mode_enabled_.store(on, std::memory_order_relaxed); }
@@ -785,12 +1041,14 @@ void AuthGate::stop()
  * Called once at startup before the reader sees traffic, so exec_enabled_/exec_allow_ are set before any
  * tool.exec is validated. */
 void AuthGate::enable_exec(std::vector<std::string> allow, std::string ws_root, bool shared,
-                          std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn)
+                          std::function<std::vector<std::string>(const std::string &)> role_exec_allow_fn,
+                          std::vector<std::string> read_roots)
 {
     if (allow.empty()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         exec_allow_ = std::move(allow);
+        exec_read_roots_ = std::move(read_roots);
         ws_root_ = std::move(ws_root);
         shared_ws_ = shared;
         exec_enabled_ = true;
@@ -833,13 +1091,44 @@ void AuthGate::exec_loop()
         spec.argv = cargv.data();
         spec.cwd = job.cwd.c_str();
         spec.max_output = kExecOutputCap;
+        /* the operator's read roots (Settings) + the ones granted to THIS agent this session, copied under the
+         * lock: a grant or revoke can land while the job waits */
+        std::vector<std::string> roots;
+        size_t                   n_settings = 0; /* roots[0, n_settings) are Settings roots; the rest were asked for */
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            roots = exec_read_roots_;
+            n_settings = roots.size();
+            auto sess = session_read_roots_.find(job.to);
+            if (sess != session_read_roots_.end()) roots.insert(roots.end(), sess->second.begin(), sess->second.end());
+        }
+        std::vector<const char *> croots;
+        croots.reserve(roots.size() + 1);
+        for (auto &r : roots) croots.push_back(r.c_str());
+        croots.push_back(nullptr);
+        spec.read_roots = roots.empty() ? nullptr : croots.data();
         hc_exec_result res = {};
         hc_exec_status st = hc_exec_run(&spec, &res);
         std::string    body;
         if (st == HC_EXEC_OK)
             body = exec_reply_body(true, res.output ? std::string(res.output, res.output_len) : std::string(),
                                    res.exit_code, res.timed_out != 0);
-        else /* a host-side spawn/confine failure — nothing ran unconfined; deny with the reason */
+        else if (st == HC_EXEC_ERR_READ_ROOT) { /* name the root and why, so neither side guesses */
+            std::string why = "more run read folders than the jail accepts";
+            std::string fix = " -- the operator can remove it or add it again in Settings > RUN READ ACCESS";
+            for (size_t k = 0; k < roots.size(); k++)
+                if (const char *p = hc_exec_read_root_problem(roots[k].c_str(), job.cwd.c_str())) {
+                    why = "run read folder " + roots[k] + " " + p;
+                    if (k >= n_settings) { /* a grant this agent asked for: withdraw it so its next run works */
+                        revoke_session_read_grant(job.to, roots[k]);
+                        why = "run read folder " + roots[k] + " (granted on request) " + p;
+                        fix = " -- it has been revoked, so run the command again (and request it again if you "
+                              "still need it)";
+                    }
+                    break;
+                }
+            body = exec_reply_body(false, "exec refused: " + why + fix, -1, false);
+        } else /* a host-side spawn/confine failure — nothing ran unconfined; deny with the reason */
             body = exec_reply_body(false, std::string("exec unavailable: ") + hc_exec_strerror(st), -1, false);
         hc_exec_result_free(&res);
         {

@@ -539,8 +539,10 @@ char *memory_write_invoke(const char *args_json, void *user)
 const char kRunName[] = "run";
 const char kRunSpec[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"run\",\"description\":\"Run an allowlisted command (e.g. a "
-    "test runner or build tool) in a kernel-sandboxed child (NO network; can only touch your workspace) and get "
-    "back its combined stdout+stderr and exit code. Each run needs operator approval. Provide the command as an "
+    "test runner or build tool) in a kernel-sandboxed child and get back its combined stdout+stderr and exit "
+    "code. NO network. It can WRITE only inside your workspace, and READ your workspace, the system dirs, and any "
+    "extra folders the operator has granted -- reading anything else fails with permission denied (ask for more with request_read_access). There is no "
+    "shell expansion and HOME is your workspace, so name files outside it by ABSOLUTE path. Each run needs operator approval. Provide the command as an "
     "argv ARRAY (no shell parsing): argv[0] is the ABSOLUTE path to the "
     "binary.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"argv\":{\"type\":\"array\",\"items\":{"
     "\"type\":\"string\"},\"description\":\"the command + args; argv[0] = an absolute binary path\"}},"
@@ -614,15 +616,106 @@ char *run_invoke(const char *args_json, void *user)
     }
     if (dismissed)
         return dup_str("deferred: the operator set this aside — the command did not run; ask again if still needed");
-    if (!approved)
-        return dup_str("denied: the operator declined the command, or it is not on the run allowlist");
+    if (!approved) /* the host names its reason when the command was approved but could not run */
+        return dup_str(output.empty() ? "denied: the operator declined the command, or it is not on the run allowlist"
+                                      : "not run: " + output);
     std::string res = "exit " + std::to_string(exit_code) + (timed_out ? " (TIMED OUT — killed)\n" : "\n") +
                       (output.empty() ? "(no output)" : output);
     if (res.size() > 240u * 1024) res.resize(240u * 1024);
     return dup_str(res);
 }
 
+/* --- request_read_access: ask the OPERATOR to let this agent's `run` jail read one more folder (or file) outside
+ * the workspace, for as long as the project stays open. The host resolves the path, refuses what can never be granted, answers at once
+ * when it is already readable, and otherwise always prompts (never auto-approved). Registered with `run`. --- */
+const char kReadAccessName[] = "request_read_access";
+const char kReadAccessSpec[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"request_read_access\",\"description\":\"Ask the "
+    "operator to let your run commands READ a folder (or a single file) outside your workspace, for as long as "
+    "this project stays open (later tasks too). Use it when a run failed with permission denied on a path you "
+    "genuinely need to read. The operator sees the resolved path and your reason, and may decline; do not ask "
+    "again for a path they declined. It never grants write or execute access. The path must be absolute with no "
+    ". or .. segments; /, /proc, /dev and /sys can never be granted.\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"path\":{\"type\":\"string\",\"description\":\"ABSOLUTE path of the folder or file to read\"},"
+    "\"reason\":{\"type\":\"string\",\"description\":\"one sentence: why you need it (shown to the "
+    "operator)\"}},\"required\":[\"path\",\"reason\"]}}}";
+
+char *read_access_invoke(const char *args_json, void *user)
+{
+    RunToolCtx *ctx = static_cast<RunToolCtx *>(user);
+    hc_json    *args = hc_json_parse(args_json ? args_json : "", args_json ? strlen(args_json) : 0);
+    std::string path = args ? hc_json_get_str(args, "path", "") : "";
+    std::string reason = args ? hc_json_get_str(args, "reason", "") : "";
+    hc_json_free(args);
+    if (path.empty() || path[0] != '/' || path.size() > 1024)
+        return dup_str("error: request_read_access needs an ABSOLUTE path (<= 1024 bytes)");
+    if (reason.empty()) return dup_str("error: request_read_access needs a reason (shown to the operator)");
+    if (reason.size() > 512) reason.resize(512);
+
+    hc_json *o = hc_json_new_object();
+    if (!o) return dup_str("error: out of memory");
+    hc_json_obj_set_str(o, "cmd", "exec.read_access");
+    hc_json_obj_set_str(o, "path", path.c_str());
+    hc_json_obj_set_str(o, "reason", reason.c_str());
+    char *bs = hc_json_print(o, false);
+    hc_json_free(o);
+    std::string req = bs ? bs : "";
+    free(bs);
+    if (req.empty()) return dup_str("error: out of memory");
+
+    uint64_t c = ++(*ctx->corr);
+    if (!ctx->bus->send_request("authgate", c, req)) return dup_str("denied: cannot reach the exec gate");
+    Message reply;
+    if (!await_reply_patient(*ctx->bus, c, approval_timeout_ms(), &reply))
+        return dup_str("denied: no operator answer (the exec gate is unreachable or a bounded timeout elapsed)");
+    bool        approved = false, dismissed = false;
+    std::string granted, note;
+    if (hc_json *r = hc_json_parse(reply.body.data(), reply.body.size())) {
+        approved = hc_json_get_bool(r, "approved", false);
+        dismissed = hc_json_get_bool(r, "dismissed", false);
+        granted = hc_json_get_str(r, "path", "");
+        note = hc_json_get_str(r, "note", "");
+        hc_json_free(r);
+    }
+    if (dismissed)
+        return dup_str("deferred: the operator set this aside -- nothing was granted; ask again if still needed");
+    std::string shown = granted.empty() ? path : granted;
+    if (!approved) return dup_str("not granted: " + shown + (note.empty() ? "" : " -- " + note));
+    return dup_str("granted: your run commands may now READ " + shown + " (read-only, until the project closes)" +
+                   (note.empty() ? "" : " -- " + note));
+}
+
+/* `s` escaped for the inside of a JSON string literal */
+std::string json_escaped(const std::string &s)
+{
+    std::string o;
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            o += '\\';
+            o += (char)c;
+        } else if (c < 0x20) {
+            char b[8];
+            snprintf(b, sizeof b, "\\u%04x", c);
+            o += b;
+        } else
+            o += (char)c;
+    }
+    return o;
+}
+
 } // namespace
+
+std::string run_tool_spec(const std::vector<std::string> &read_roots)
+{
+    std::string       s = kRunSpec;
+    static const char anchor[] = "any extra folders the operator has granted";
+    size_t            at = s.find(anchor);
+    if (read_roots.empty() || at == std::string::npos) return s;
+    std::string list = " (";
+    for (size_t i = 0; i < read_roots.size(); i++) list += (i ? ", " : "") + json_escaped(read_roots[i]);
+    s.insert(at + sizeof anchor - 1, list + ")");
+    return s;
+}
 
 std::string query_memory(BusClient &bus, uint64_t *corr, const std::string &query)
 {
@@ -715,8 +808,10 @@ void register_agent_tools(hc_agent *ag, FsToolCtx *fs, ReasonToolCtx *rz, MemToo
         }
     }
     if (exec_enabled && run) { /* the run tool exists ONLY when the operator has a non-empty exec allowlist */
-        hc_agent_tool t{kRunName, kRunSpec, run_invoke, run};
+        hc_agent_tool t{kRunName, run->spec.empty() ? kRunSpec : run->spec.c_str(), run_invoke, run};
         hc_agent_add_tool(ag, &t);
+        hc_agent_tool ra{kReadAccessName, kReadAccessSpec, read_access_invoke, run}; /* only alongside run */
+        hc_agent_add_tool(ag, &ra);
     }
     if (skills && skills->sb && on.load_skill) { /* W6 P6.2: only when a skills dir exists AND the role allows */
         hc_agent_tool t{kLoadSkillName, kLoadSkillSpec, load_skill_invoke, skills};

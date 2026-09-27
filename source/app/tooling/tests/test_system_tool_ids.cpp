@@ -19,7 +19,7 @@ int main()
 {
     /* every built-in worker + conductor tool name is reserved */
     for (const char *n : {"fs_write", "fs_read", "fs_list", "fs_update", "deep_reason", "memory_recall",
-                          "memory_write", "run", "load_skill", "set_goal", "plan_goal", "run_agenda",
+                          "memory_write", "run", "request_read_access", "load_skill", "set_goal", "plan_goal", "run_agenda",
                           "agenda_status", "read_artifact", "recall_memory", "write_memory", "ask_user",
                           "add_worker", "remove_worker", "set_mood", "control_audio"})
         CHECK(is_reserved_tool_name(n), n);

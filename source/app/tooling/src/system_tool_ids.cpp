@@ -13,7 +13,7 @@ namespace {
 const char *const kReservedNames[] = {
     /* worker System Tools */
     "fs_write", "fs_read", "fs_list", "fs_update", "deep_reason", "memory_recall", "memory_write", "run",
-    "load_skill",
+    "request_read_access", "load_skill",
     /* conductor control-plane tools */
     "set_goal", "update_goal", "plan_goal", "run_agenda", "agenda_status", "agenda_results", "read_artifact",
     "steer_or_cancel", "recall_memory", "write_memory", "ask_user", "add_worker", "remove_worker", "list_workers",

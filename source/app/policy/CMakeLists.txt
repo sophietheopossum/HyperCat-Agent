@@ -6,7 +6,7 @@ add_library(hc_policy STATIC src/hc_policy.cpp)
 add_library(hc::policy ALIAS hc_policy)
 
 target_include_directories(hc_policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(hc_policy PUBLIC hc::http PRIVATE hc_warnings hc_sanitizers)
+target_link_libraries(hc_policy PUBLIC hc::http PRIVATE hc::exec hc_warnings hc_sanitizers)
 
 if(HC_BUILD_TESTS)
     add_executable(test_hc_policy tests/test_hc_policy.cpp)

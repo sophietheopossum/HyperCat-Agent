@@ -103,6 +103,19 @@ constexpr size_t kMaxExecAllow = 64;
  * (W4.3); this is operator-list hygiene. An empty list is default-deny (exec disabled). */
 bool exec_allow_edit(std::vector<std::string> &allow, const char *path, bool add);
 
+constexpr size_t kMaxExecReadRoots = 32; /* == HC_EXEC_MAX_READ_ROOTS, the run jail's own cap (static_assert'd) */
+
+/* Apply ONE authoritative exec read-root edit (mirrors exec_allow_edit; the host is the authority, the UI is
+ * advisory). add=true: append the CANONICAL form of `path` (hc_exec_read_root_canonical -- the run jail's own
+ * rule: it exists, is a folder or a regular file, and is not the whole filesystem or inside /proc, /dev or /sys
+ * once every symlink is resolved) IFF that is not already present and the list is under kMaxExecReadRoots.
+ * The resolved path is what gets stored, so the grant is the folder the operator saw, and a symlink later put
+ * on its path makes runs refuse it instead of following it. *stored (if given) receives it. add=false: remove
+ * `path` exactly as stored. Returns true IFF `roots` changed. Adding WIDENS what the run tool can disclose to
+ * the model, so the UI confirm-gates it. */
+bool exec_read_root_edit(std::vector<std::string> &roots, const char *path, bool add,
+                         std::string *stored = nullptr);
+
 } // namespace hc
 
 /* C-callable guard for hc_http_set_guard. `user` MUST be a const hc::EgressPolicy*. Fail-closed:

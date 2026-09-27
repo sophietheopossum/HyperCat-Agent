@@ -380,7 +380,7 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
     if (ImGui::BeginPopupModal("Confirm run-allow entry", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("Allow the fleet to RUN:");
         ImGui::TextColored(accent_v4(), "%s", execpending);
-        ImGui::TextColored(muted_v4(), "Each run stays operator-gated + kernel-jailed (no network, workspace only).");
+        ImGui::TextColored(muted_v4(), "Each run stays operator-gated + kernel-jailed (no network; writes its workspace only).");
         ImGui::TextColored(err_v4(), "Only allow binaries you trust the fleet to execute.");
         ImGui::Spacing();
         if (ImGui::Button("Confirm \xE2\x80\x94 allow")) { /* "Confirm — allow" */
@@ -390,6 +390,75 @@ void draw_settings_panel(const UiSnapshot &s, DrawCtx &ctx, bool *open)
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel##exec")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::Spacing();
+    PanelHeader("RUN READ ACCESS (advanced)");
+    ImGui::TextColored(muted_v4(), "extra folders (or single files) a run may READ outside its workspace -- never write or execute.");
+    ImGui::TextColored(muted_v4(), "Changes to this list apply when the project is re-opened.");
+    /* The LIVE list (EditExecReadRoots persists immediately, like the run allowlist above). Remove narrows;
+     * Add WIDENS what can reach the model and is confirm-gated. The host re-validates with the jail's own rule. */
+    for (size_t i = 0; i < live.exec_read_roots.size(); i++) {
+        ImGui::PushID((int)(11000 + i));
+        ImGui::TextUnformatted(live.exec_read_roots[i].c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove"))
+            ctx.commands.push_back({UiCommand::Kind::EditExecReadRoots, live.exec_read_roots[i], "remove", 0, {}, {}});
+        ImGui::PopID();
+    }
+    if (live.exec_read_roots.empty()) ImGui::TextColored(muted_v4(), "(none — runs read only their workspace)");
+    /* granted on request (an approved request_read_access): one worker each, gone when the project closes or the
+     * worker leaves the fleet. Revoke narrows at once, from that agent's next command. */
+    if (!s.session_read_grants.empty()) {
+        ImGui::TextColored(muted_v4(), "granted on request, until the project closes (Revoke applies from that "
+                                       "agent's next command):");
+        for (size_t i = 0; i < s.session_read_grants.size(); i++) {
+            const auto &g = s.session_read_grants[i];
+            ImGui::PushID((int)(12000 + i));
+            ImGui::TextColored(accent_v4(), "%s", g.agent.c_str());
+            ImGui::SameLine();
+            ImGui::TextUnformatted(g.path.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Revoke"))
+                ctx.commands.push_back({UiCommand::Kind::RevokeSessionReadGrant, g.agent, g.path, 0, {}, {}});
+            ImGui::PopID();
+        }
+    }
+
+    static char rrbuf[512] = {};
+    static char rrpending[512] = {};
+    static char rrerr[96] = {};
+    ImGui::SetNextItemWidth(280);
+    ImGui::InputText("##rr_add", rrbuf, sizeof rrbuf);
+    ImGui::SameLine();
+    if (ImGui::Button("Add\xE2\x80\xA6##rr")) { /* "Add…" */
+        rrerr[0] = '\0';
+        if (rrbuf[0] && rrbuf[0] != '/')
+            std::snprintf(rrerr, sizeof rrerr, "must be an absolute path (e.g. /home/you/src)");
+        else if (rrbuf[0]) {
+            std::snprintf(rrpending, sizeof rrpending, "%s", rrbuf);
+            ImGui::OpenPopup("Confirm run read root");
+        }
+    }
+    if (rrerr[0]) ImGui::TextColored(err_v4(), "%s", rrerr);
+
+    if (ImGui::BeginPopupModal("Confirm run read root", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Let the fleet's commands READ:");
+        ImGui::TextColored(accent_v4(), "%s", rrpending);
+        ImGui::TextColored(muted_v4(), "Read-only: never written or executed. /, /proc, /dev and /sys are refused.");
+        ImGui::TextColored(muted_v4(), "A symlink is stored as the folder it names; if that later changes, runs refuse it.");
+        ImGui::TextColored(muted_v4(), "Everything beneath a folder becomes readable, named pipes included.");
+        ImGui::TextColored(err_v4(), "Anything readable here can reach the model in a command's output -- keys,");
+        ImGui::TextColored(err_v4(), "tokens and private files included. With ALLOW-ALL armed there is no prompt.");
+        ImGui::Spacing();
+        if (ImGui::Button("Confirm \xE2\x80\x94 allow reading")) { /* "Confirm — allow reading" */
+            ctx.commands.push_back({UiCommand::Kind::EditExecReadRoots, std::string(rrpending), "add", 0, {}, {}});
+            rrbuf[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##rr")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 

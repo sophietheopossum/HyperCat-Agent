@@ -77,6 +77,10 @@ struct Settings {
     std::vector<std::string> egress_allow; /* exact numeric IPs re-permitted past the SSRF default-deny */
     std::vector<std::string> exec_allow;   /* absolute paths permitted for the brokered `run` tool ([] = deny-all,
                                             * exec disabled) — Worker Revamp W4 */
+    std::vector<std::string> exec_read_roots; /* extra READ-ONLY folders/files the `run` jail may read outside
+                                               * the workspace ([] = workspace only), stored with symlinks
+                                               * resolved; never written or executed. Anything readable can
+                                               * reach the model via a command's output. */
 
     /* automation (B3/B4) — operator opt-in DELEGATED approval; BOTH default OFF, the human gate stays the floor.
      * auto_approve_contained: deterministically auto-approve sandbox-contained writes (fs_write/fs_update) ONLY —

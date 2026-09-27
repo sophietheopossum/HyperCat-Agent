@@ -77,9 +77,14 @@ struct MemToolCtx {
  * worker NEVER execve's — it sends a validated argv to the host, which re-validates + operator-gates + runs it
  * in the kernel jail (hc_exec) and returns the captured output. Registered ONLY when exec is enabled. */
 struct RunToolCtx {
-    BusClient *bus;
-    uint64_t  *corr;
+    BusClient  *bus;
+    uint64_t   *corr;
+    std::string spec; /* the run tool's JSON spec (run_tool_spec); empty => the stock one */
 };
+
+/* The run tool's JSON spec with the operator's granted read folders (--exec-read-root) named in its
+ * description, so the model knows where it may read outside its workspace; the stock spec when there are none. */
+std::string run_tool_spec(const std::vector<std::string> &read_roots);
 
 /* skills context (W6 P6.2): the jailed skills root (== --skills-dir, opened by the worker). The load_skill tool
  * reads "<name>/SKILL.md" relative to it (the sandbox O_NOFOLLOW walk confines + symlink-refuses it). Registered

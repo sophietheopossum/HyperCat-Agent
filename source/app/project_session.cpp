@@ -185,7 +185,7 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
             return {};
         };
         s->svc_.gate->enable_exec(settings->settings.exec_allow, s->info_.ws_root, s->info_.shared_workspace,
-                                  std::move(role_exec_fn));
+                                  std::move(role_exec_fn), settings->settings.exec_read_roots);
     }
 
     /* W1.3: confirm a file-producing task actually wrote its declared deliverable before it settles Done. */
@@ -308,6 +308,10 @@ ProjectSession *ProjectSession::open(const std::string &project_dir, bool epheme
      * conductor tool). svc_ is a stable heap member, so the captured pointer is valid until the dtor clears it. */
     HostServices *svcp = &s->svc_;
     s->fleet_->set_on_change([svcp](const std::vector<std::string> &ids) { sync_fleet_filters(*svcp, ids); });
+    /* a removed worker's run read grants go before its id can be reissued (see Fleet::set_on_remove) */
+    s->fleet_->set_on_remove([svcp](const std::string &id) {
+        if (svcp->gate) svcp->gate->forget_agent(id);
+    });
 
     /* Conductor P5: the front-door agent. It gets the PROJECT dir so its durable goals land under
      * projects/<id>/conductor_goals (the per-project isolation). Its own chat client (NOT planner_llm). */
@@ -357,7 +361,10 @@ ProjectSession::~ProjectSession()
      * dereference the freed conductor — the R2 invariant, now enforced by the orchestrator rather than by ordering. */
     teardown_conductor();
     /* T2: stop refreshing the bus filters — both mutators (UI loop returned; conductor joined) are now gone. */
-    if (fleet_) fleet_->set_on_change(nullptr);
+    if (fleet_) {
+        fleet_->set_on_change(nullptr);
+        fleet_->set_on_remove(nullptr);
+    }
     /* T3 (the delete-orch half): JOIN the orchestrator driver. teardown_conductor already barrier-unbound the settle
      * observer, so no settle can fire into the freed conductor between teardown and the join. */
     delete orch_;

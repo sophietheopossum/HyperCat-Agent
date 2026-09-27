@@ -106,7 +106,12 @@ static UiSnapshot sample()
 
     s.pending_auth = {{"auth-1", "agent:A", "fs_write",
                        "fs_write (create or replace) reverse.txt  (41 bytes)\ndef reverse_string(s): "
-                       "return s[::-1]"}};
+                       "return s[::-1]"},
+                      {"read-2", "agent:B", "read_access",
+                       "read access for this agent's run commands, until the project is closed:\n/home/you/src/lib\n"
+                       "Read-only: never written or executed. Anything readable can reach the model in a command's "
+                       "output.\nagent's stated reason (unverified): \"the failing test imports from here\""}};
+    s.session_read_grants = {{"agent:A", "/home/you/src/vendor"}}; /* granted on request */
 
     s.terminal = "hypercat$ ls\nagent_A  agent_B\nhypercat$ cat agent_A/reverse.txt\n"
                  "def reverse_string(s): return s[::-1]\nhypercat$ ";
@@ -378,6 +383,7 @@ int main(int argc, char **argv)
         us.ov_model = true; /* show an env-locked field disabled */
         us.egress_allow = {"192.168.1.50"};
         us.exec_allow = {"/usr/bin/pytest", "/usr/bin/git"}; /* W4: the run allowlist editor populated */
+        us.exec_read_roots = {"/home/you/src"};               /* the run read-access editor populated */
         app->apply_settings(us); /* draft-read fields; the persona is seeded on the snapshot above (live-owned) */
         app->pin_window("Settings");
     }

@@ -6,7 +6,7 @@
 add_library(hc_settings STATIC src/hc_settings.cpp)
 add_library(hc::settings ALIAS hc_settings)
 target_include_directories(hc_settings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(hc_settings PRIVATE hc::json hc::fs hc_warnings hc_sanitizers)
+target_link_libraries(hc_settings PRIVATE hc::json hc::fs hc::exec hc_warnings hc_sanitizers)
 
 if(HC_BUILD_TESTS)
   # the pure offline gate: round-trip (incl. the sparse panels map + egress list), malformed/missing ->

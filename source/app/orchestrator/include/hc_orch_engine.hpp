@@ -138,10 +138,11 @@ public:
     void set_max_attempts(int n); /* total dispatches per task before terminal Fail (>=1) */
     int  max_attempts() const;
 
-    /* Per-task deadline. 0 (default) = off. A task Assigned/Running/Verifying longer than `ms` is treated
-     * as a stuck-worker loss — check_deadlines() removes the (alive but presumed-hung) worker from
-     * scheduling and reassigns its task to a survivor (or fails it past the attempt budget). Applies
-     * across all active agendas. The driver calls check_deadlines() on its periodic wake. */
+    /* Per-task deadline. 0 (default) = off. A task Assigned/Running/Verifying with no progress (note_progress)
+     * for `ms` has its work taken back: the task is reassigned to a survivor (or failed past the attempt
+     * budget) and an owed verification is settled fail-closed. The (alive) worker stays in the pool as a busy
+     * provider until its late result frees it; one silent for a second deadline is dropped. Applies across
+     * all active agendas. The driver calls check_deadlines() on its periodic wake. */
     void                set_task_deadline_ms(uint64_t ms);
     std::vector<Intent> check_deadlines();
 

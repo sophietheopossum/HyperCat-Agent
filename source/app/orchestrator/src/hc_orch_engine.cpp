@@ -57,6 +57,10 @@ struct AgendaCtx {
     Agenda                                       agenda;
     std::unordered_map<std::string, VerifyState> verifying;          /* per-task tally (this agenda) */
     bool                                         done_emitted = false; /* terminal verdict emitted once */
+    /* Which admission this is. Agenda ids are reused (the UI's "ui-agenda", a conductor goal re-run), so
+     * anything remembered across events about a task — an overran worker's held task — must name the
+     * admission too, or a late result from an old run could be credited to a new run's same-named task. */
+    uint64_t                                     gen = 0;
 };
 
 struct Engine::Impl {
@@ -66,8 +70,25 @@ struct Engine::Impl {
     struct PoolEntry {
         std::string role;
         bool        busy = false;
+        /* Overran: the worker blew a task deadline while still alive. Its task was taken back (reassigned or
+         * failed), but the worker stays in the pool as a busy provider — it is presumably still working, and a
+         * slow-but-healthy worker must not vanish as a provider (that is what made fail_unrunnable report
+         * "no agent provides capability" while the fleet listed the worker ready). It is freed by its late
+         * result (credited if the task is still waiting) or dropped by worker_lost if it dies; one that stays
+         * silent for a SECOND deadline is dropped for real (check_deadlines). */
+        bool        overran = false;
+        uint64_t    overran_at_ms = 0;
+        std::string held_agenda; /* overran: what it was doing when taken back (a verify is "verify:<task>") */
+        std::string held_task;
+        uint64_t    held_gen = 0; /* ...in which admission of held_agenda (AgendaCtx::gen) */
     };
     std::unordered_map<std::string, PoolEntry> pool; /* schedulable workers, SHARED across agendas */
+
+    /* Workers dropped after overrunning twice, by role — only so fail_unrunnable can say WHY a capability has
+     * no provider left instead of implying none was ever there. Cleared when a worker of the role returns. */
+    std::unordered_map<std::string, std::vector<std::string>> dropped_for_deadline;
+
+    uint64_t next_gen = 1; /* AgendaCtx::gen source */
 
     int max_attempts = 2; /* total dispatches per task before a terminal Fail (1 retry) */
 
@@ -97,16 +118,50 @@ struct Engine::Impl {
 
     bool has_provider(const std::string &capability)
     {
-        /* an exact-role provider OR a generalist (the catch-all) keeps a task runnable rather than fail_unrunnable */
+        /* an exact-role provider OR a generalist (the catch-all) keeps a task runnable rather than fail_unrunnable.
+         * An overran worker still counts: it is alive and will free up (see PoolEntry::overran). */
         for (auto &kv : pool)
             if (role_matches(capability, kv.second.role) || kv.second.role == kGeneralistRole) return true;
         return false;
     }
 
+    /* Why `capability` has no provider: none was ever added, or the ones there were overran the task deadline
+     * twice and were dropped. The second must not read as the first — the fleet still lists those workers. */
+    std::string no_provider_reason(const std::string &capability)
+    {
+        std::string dropped;
+        for (const auto &kv : dropped_for_deadline) {
+            if (!role_matches(capability, kv.first) && kv.first != kGeneralistRole) continue;
+            for (const auto &id : kv.second) dropped += (dropped.empty() ? "" : ", ") + id;
+        }
+        if (dropped.empty()) return "blocked: no agent provides capability '" + capability + "'";
+        return "blocked: every agent that could run '" + capability + "' (" + dropped +
+               ") went silent past the task deadline twice and was dropped; raise the task deadline or check "
+               "the worker";
+    }
+
     void free_worker(const std::string &id)
     {
         auto it = pool.find(id);
-        if (it != pool.end()) it->second.busy = false;
+        /* An overran worker is still running something: only its own late result (on_late_result) or its
+         * loss (worker_lost) may free it — never a path that merely stops tracking what it was doing. */
+        if (it != pool.end() && !it->second.overran) it->second.busy = false;
+    }
+
+    /* `id` is still running work that no longer counts (taken back at a deadline, left over from a verification
+     * that settled early, or part of a cancelled agenda): keep it busy — handing it new work now would only get
+     * "busy" back and burn an attempt — until its late result frees it. */
+    void mark_overran(const std::string &id, const std::string &agenda_id, const std::string &task_id, uint64_t gen)
+    {
+        auto it = pool.find(id);
+        if (it == pool.end()) return;
+        PoolEntry &e = it->second;
+        e.busy = true;
+        e.overran = true;
+        e.overran_at_ms = now();
+        e.held_agenda = agenda_id;
+        e.held_task = task_id;
+        e.held_gen = gen;
     }
 
     /* ---- per-agenda helpers ---- */
@@ -117,6 +172,49 @@ struct Engine::Impl {
     {
         if (t.state != TaskState::Assigned && t.state != TaskState::Running) return;
         task_advance(t, t.attempts < max_attempts ? TaskState::Pending : TaskState::Failed);
+    }
+
+    /* Take everything `id` holds away from it, in every agenda: a task it was running is reassigned (or
+     * failed past its budget), and a verification it owed is settled fail-closed. Records the first thing
+     * taken in `held_agenda`/`held_task` (a worker does one thing at a time) so a late result can be
+     * recognised. Shared by worker_lost (the worker is gone) and check_deadlines (it overran). */
+    void release_worker(const std::string &id, std::string *held_agenda, std::string *held_task,
+                        uint64_t *held_gen)
+    {
+        for (auto &ctx : agendas) {
+            for (auto &t : ctx.agenda.tasks)
+                if (t.assignee == id
+                    && (t.state == TaskState::Assigned || t.state == TaskState::Running)) {
+                    if (held_task && held_task->empty()) {
+                        *held_agenda = ctx.agenda.id;
+                        *held_task = t.id;
+                        *held_gen = ctx.gen;
+                    }
+                    fail_or_reassign(t);
+                }
+            std::vector<std::string> to_resolve;
+            for (auto &kv : ctx.verifying)
+                if (kv.second.assigned.erase(id)) {
+                    kv.second.reported++;
+                    to_resolve.push_back(kv.first);
+                    if (held_task && held_task->empty()) {
+                        *held_agenda = ctx.agenda.id;
+                        *held_task = "verify:" + kv.first;
+                        *held_gen = ctx.gen;
+                    }
+                }
+            for (const auto &tid : to_resolve) resolve_verification(ctx, tid);
+        }
+    }
+
+    /* The overran worker has reported (or is being dropped): it no longer holds anything. */
+    void clear_overran(PoolEntry &e)
+    {
+        e.overran = false;
+        e.overran_at_ms = 0;
+        e.held_agenda.clear();
+        e.held_task.clear();
+        e.held_gen = 0;
     }
 
     /* Fail every still-Pending task in `a` whose dependency can never be satisfied, to a fixpoint. */
@@ -189,6 +287,10 @@ struct Engine::Impl {
             if (o == VerifyOutcome::Unproven)
                 t->result = vs.claim + "\n[verification inconclusive — not refuted]";
         }
+        /* The tally can settle before every verifier reports (a first refute, or the quorum reached early).
+         * Those still verifying keep running: hold them busy until their late verdict frees them, instead of
+         * leaving them busy with nothing that could ever free them. */
+        for (const auto &v : vs.assigned) mark_overran(v, ctx.agenda.id, "verify:" + task_id, ctx.gen);
         ctx.verifying.erase(it);
     }
 
@@ -285,9 +387,8 @@ struct Engine::Impl {
                 bool dep_broken = task_dep_unsatisfiable(ctx.agenda, t);
                 if (!task_advance(t, TaskState::Failed)) continue;
                 t.result = dep_broken ? "blocked: a dependency failed or is missing"
-                           : !has_provider(t.capability)
-                               ? "blocked: no agent provides capability '" + t.capability + "'"
-                               : "blocked: unsatisfiable dependency (a cycle or deadlock)";
+                           : !has_provider(t.capability) ? no_provider_reason(t.capability)
+                                                         : "blocked: unsatisfiable dependency (a cycle or deadlock)";
             }
             emit_verdict_if_settled(ctx, out);
         }
@@ -307,6 +408,10 @@ std::vector<Intent> Engine::add_agenda(Agenda agenda)
     if (p_->find_ctx(agenda.id)) return {}; /* a duplicate active id — reject, leave state unchanged */
     AgendaCtx ctx;
     ctx.agenda = std::move(agenda);
+    ctx.gen = p_->next_gen++;
+    /* The driver re-registers the live roster right before each admission, so an older "dropped for the
+     * deadline" note would only mislead a new agenda about workers that may no longer exist. */
+    p_->dropped_for_deadline.clear();
     p_->agendas.push_back(std::move(ctx));
     return p_->dispatch(); /* the new agenda may immediately schedule onto idle workers */
 }
@@ -317,13 +422,15 @@ std::vector<Intent> Engine::cancel_agenda(const std::string &agenda_id)
     if (!ctx) return {};
     /* free every pool worker this agenda occupies (in-flight task assignees + its verifiers), then
      * force-fail its non-terminal tasks so it settles to AgendaFailed. */
+    /* Workers still RUNNING this agenda's work (task assignees and verifiers) are not idle just because the
+     * work stopped counting: they are held busy until their late result arrives (or they die), so they are
+     * never handed new work mid-run. A Verifying task's assignee is its author, already freed at on_result. */
     for (const auto &kv : ctx->verifying)
-        for (const auto &v : kv.second.assigned) p_->free_worker(v);
+        for (const auto &v : kv.second.assigned) p_->mark_overran(v, agenda_id, "verify:" + kv.first, ctx->gen);
     ctx->verifying.clear();
     for (auto &t : ctx->agenda.tasks) {
-        if (t.state == TaskState::Assigned || t.state == TaskState::Running
-            || t.state == TaskState::Verifying)
-            p_->free_worker(t.assignee);
+        if (t.state == TaskState::Assigned || t.state == TaskState::Running)
+            p_->mark_overran(t.assignee, agenda_id, t.id, ctx->gen);
         if (t.state != TaskState::Done && t.state != TaskState::Failed) {
             task_advance(t, TaskState::Failed);
             t.result = "cancelled by operator";
@@ -352,7 +459,12 @@ void Engine::remove_agenda(const std::string &agenda_id)
 
 std::vector<Intent> Engine::worker_ready(const std::string &id, const std::string &role)
 {
-    p_->pool[id] = {role, false};
+    /* The driver re-registers the WHOLE roster on every run_agenda, so this must not reset a worker it
+     * already knows: clearing `busy` would hand new work to one still running an earlier task (it would
+     * answer "busy" and burn an attempt), and clearing `overran` would forget what it still owes. Refresh
+     * the role only. */
+    p_->pool[id].role = role; /* a new entry starts idle; an existing one keeps its busy/overran state */
+    p_->dropped_for_deadline.erase(role); /* a provider of this role is back */
     return p_->dispatch(); /* a new idle worker may unblock pending tasks in any agenda */
 }
 
@@ -361,20 +473,73 @@ std::vector<Intent> Engine::worker_lost(const std::string &id)
     /* Reassign (or fail) any task this worker held in ANY agenda, settle any verification it owed
      * (fail-closed), then forget the worker so it is never scheduled again (a respawn re-enters via
      * worker_ready). */
+    p_->release_worker(id, nullptr, nullptr, nullptr);
+    p_->pool.erase(id);
+    return p_->dispatch();
+}
+
+std::vector<Intent> Engine::note_progress(const std::string &id)
+{
+    /* The worker is alive and moving: restart the deadline of whatever it is doing. A verifier's progress
+     * restarts its task's verify window. Nothing to schedule. */
+    uint64_t now_ms = p_->now();
     for (auto &ctx : p_->agendas) {
         for (auto &t : ctx.agenda.tasks)
-            if (t.assignee == id
-                && (t.state == TaskState::Assigned || t.state == TaskState::Running))
-                p_->fail_or_reassign(t);
-        std::vector<std::string> to_resolve;
+            if (t.assignee == id && (t.state == TaskState::Assigned || t.state == TaskState::Running))
+                t.assigned_at_ms = now_ms;
         for (auto &kv : ctx.verifying)
-            if (kv.second.assigned.erase(id)) {
-                kv.second.reported++;
-                to_resolve.push_back(kv.first);
+            if (kv.second.assigned.count(id)) {
+                Task *t = agenda_find(ctx.agenda, kv.first);
+                if (t && t->state == TaskState::Verifying) t->assigned_at_ms = now_ms;
             }
-        for (const auto &tid : to_resolve) p_->resolve_verification(ctx, tid);
     }
-    p_->pool.erase(id);
+    auto it = p_->pool.find(id);
+    if (it != p_->pool.end() && it->second.overran) it->second.overran_at_ms = now_ms; /* not silent either */
+    return {};
+}
+
+bool Engine::overran_assignment(const std::string &worker, std::string &agenda_id, std::string &task_id) const
+{
+    auto it = p_->pool.find(worker);
+    if (it == p_->pool.end() || !it->second.overran) return false;
+    agenda_id = it->second.held_agenda;
+    task_id = it->second.held_task;
+    return true;
+}
+
+std::vector<std::string> Engine::overran_workers() const
+{
+    std::vector<std::string> ids;
+    for (const auto &kv : p_->pool)
+        if (kv.second.overran) ids.push_back(kv.first);
+    return ids;
+}
+
+std::vector<Intent> Engine::on_late_result(const std::string &worker, const std::string &task_id, bool ok,
+                                           const std::string &payload)
+{
+    auto it = p_->pool.find(worker);
+    if (it == p_->pool.end() || !it->second.overran) return p_->dispatch();
+    const std::string agenda_id = it->second.held_agenda;
+    const uint64_t    gen = it->second.held_gen;
+    const std::string role = it->second.role;
+    const bool        matches = !it->second.held_task.empty() && it->second.held_task == task_id;
+    /* Whatever it reported, it has finished and is free again. */
+    it->second.busy = false;
+    p_->clear_overran(it->second);
+    AgendaCtx *ctx = p_->find_ctx(agenda_id);
+    /* Only the SAME admission's task: the agenda may have settled and a new run reused its id and task ids. */
+    if (ctx && ctx->gen != gen) ctx = nullptr;
+    Task *t = (matches && ctx) ? agenda_find(ctx->agenda, task_id) : nullptr;
+    if (t && !role_matches(t->capability, role) && role != kGeneralistRole) t = nullptr;
+    /* Credit the finished work if the task is still waiting for someone. If it was handed to another worker
+     * meanwhile (or failed past its budget), that one's outcome stands and this result is only dropped. */
+    if (ok && t && t->state == TaskState::Pending && task_advance(*t, TaskState::Assigned)) {
+        t->assignee = worker;
+        t->assigned_at_ms = p_->now();
+        p_->pool[worker].busy = true; /* on_result frees it again */
+        return on_result(agenda_id, task_id, true, payload);
+    }
     return p_->dispatch();
 }
 
@@ -439,8 +604,18 @@ std::vector<Intent> Engine::on_verdict(const std::string &agenda_id, const std::
     if (!ctx) return {};
     Task *t = agenda_find(ctx->agenda, task_id);
     auto  it = ctx->verifying.find(task_id);
-    if (!t || t->state != TaskState::Verifying || it == ctx->verifying.end())
-        return p_->dispatch(); /* the task already resolved (a prior refute, say) — late verdict ignored */
+    if (!t || t->state != TaskState::Verifying || it == ctx->verifying.end()) {
+        /* The task already resolved (a prior refute, say): the verdict is ignored, but a verifier left over from
+         * that early settle is waiting on exactly this — free it (the driver also lands here when a leftover
+         * verifier's assign was undeliverable, in which case it never started). */
+        auto pit = p_->pool.find(verifier);
+        if (pit != p_->pool.end() && pit->second.overran && pit->second.held_task == "verify:" + task_id
+            && pit->second.held_gen == ctx->gen) {
+            pit->second.busy = false;
+            p_->clear_overran(pit->second);
+        }
+        return p_->dispatch();
+    }
     auto &vs = it->second;
     /* Accept (and free) ONLY a verifier WE asked. A forged/stray "verify:" result from a worker that is
      * NOT in `assigned` must not free that worker — it may be busy on real work (would double-dispatch). */
@@ -527,14 +702,39 @@ std::vector<Intent> Engine::check_deadlines()
             }
         }
     }
-    /* A worker that overran is alive but presumed stuck — treat it exactly like a loss: worker_lost drops
-     * it from scheduling, reassigns any real task it held (in any agenda) to a survivor, and settles any
-     * verification it owed (fail-closed). */
+    /* A worker that overran is alive, so it may be slow rather than stuck. Take its work back — a real task
+     * is reassigned to a survivor (or failed past its budget), a verification it owed is settled fail-closed —
+     * but keep the worker as a busy provider rather than erasing it: erasing live workers is what made a
+     * capability with slow providers fail as "no agent provides capability". It is freed by its late result
+     * (on_late_result), dropped by worker_lost if it dies, and dropped here only if it stays silent for a
+     * second deadline. */
     std::vector<Intent> out;
     for (const auto &id : stuck) {
-        auto r = worker_lost(id);
+        auto pit = p_->pool.find(id);
+        if (pit == p_->pool.end()) { /* not a pool worker (never registered): nothing to keep */
+            auto r = worker_lost(id);
+            out.insert(out.end(), r.begin(), r.end());
+            continue;
+        }
+        std::string held_agenda, held_task;
+        uint64_t    held_gen = 0;
+        p_->release_worker(id, &held_agenda, &held_task, &held_gen);
+        /* Nothing left to take: an earlier release this tick already settled its verification and held it
+         * (resolve_verification) — keep that record rather than blanking it. */
+        if (held_task.empty() && pit->second.overran) continue;
+        p_->mark_overran(id, held_agenda, held_task, held_gen);
+    }
+    std::vector<std::string> silent;
+    for (const auto &kv : p_->pool)
+        if (kv.second.overran && !stuck.count(kv.first) && now_ms - kv.second.overran_at_ms >= p_->deadline_ms)
+            silent.push_back(kv.first);
+    for (const auto &id : silent) {
+        p_->dropped_for_deadline[p_->pool[id].role].push_back(id);
+        auto r = worker_lost(id); /* holds nothing any more; this only removes it from the pool */
         out.insert(out.end(), r.begin(), r.end());
     }
+    auto r = p_->dispatch(); /* taken-back tasks can go to idle survivors now */
+    out.insert(out.end(), r.begin(), r.end());
     return out;
 }
 

@@ -354,6 +354,68 @@ int main()
     }
 
     delete orch; /* stops + joins the driver thread, disconnects */
+
+    /* --- the task deadline measures SILENCE, over real worker processes (offline echo), against a 5 s deadline.
+     * Each slow task takes ~7.5 s. Two separate orchestrators, because the pool is shared within one. --- */
+    setenv("HC_LLM_CALL_TOTAL_MS", "5000", 1); /* the deadline's floor */
+    setenv("HC_TASK_DEADLINE_MS", "5000", 1);
+    /* (1) P is slow but reports task.progress, so it keeps its task past the deadline. Q is an idle generalist
+     * that would pick the task up (attempt 2) the moment it were taken back from P — which is what happened
+     * before, when the deadline counted total run time. */
+    {
+        Orchestrator *o2 = Orchestrator::create(sock, "orchestrator", sup);
+        CHECK(o2 != nullptr, "progress: orchestrator create");
+        if (o2) {
+            CHECK(sup->spawn("agent:P", {"--slow-task-ms", "7500"}), "progress: spawn P (slow, reports progress)");
+            CHECK(sup->spawn("agent:Q"), "progress: spawn Q (idle generalist)");
+            CHECK(wait_until([&] { return sup->is_ready("agent:P") && sup->is_ready("agent:Q"); }, 6000),
+                  "progress: P and Q check in");
+            o2->set_verify({hc::orch::VerifyMode::None, 0, 0});
+            o2->set_decomposer([](const std::string &) -> std::vector<Task> {
+                return {mk("p1", "slowp", "slow, with progress")};
+            });
+            Agenda ad;
+            ad.id = "adp";
+            ad.goal = "progress";
+            std::vector<std::pair<std::string, std::string>> dpool = {{"agent:P", "slowp"}, {"agent:Q", "generalist"}};
+            CHECK(o2->run_agenda(ad, dpool), "progress: run agenda");
+            CHECK(o2->wait_until_done("adp", 30000) == Orchestrator::Verdict::Done, "progress: the slow task completes");
+            Agenda ds = o2->snapshot("adp");
+            CHECK(ds.tasks.size() == 1 && ds.tasks[0].state == TaskState::Done && ds.tasks[0].attempts == 1,
+                  "progress: the progress-reporting worker was never taken off its task (no second attempt on Q)");
+            delete o2;
+        }
+    }
+    /* (2) S is slow and silent, and the only worker that can run its task. At the deadline the task is taken
+     * back, but S stays a provider — before, it was dropped and the task failed "no agent provides
+     * capability" — and when S finishes anyway its late result is credited. */
+    {
+        Orchestrator *o3 = Orchestrator::create(sock, "orchestrator", sup);
+        CHECK(o3 != nullptr, "silent: orchestrator create");
+        if (o3) {
+            CHECK(sup->spawn("agent:S", {"--silent-slow-task-ms", "7500"}), "silent: spawn S (slow, silent)");
+            CHECK(wait_until([&] { return sup->is_ready("agent:S"); }, 6000), "silent: S checks in");
+            o3->set_verify({hc::orch::VerifyMode::None, 0, 0});
+            o3->set_decomposer([](const std::string &) -> std::vector<Task> {
+                return {mk("s1", "slows", "slow and silent")};
+            });
+            Agenda ad;
+            ad.id = "ads";
+            ad.goal = "silent";
+            std::vector<std::pair<std::string, std::string>> dpool = {{"agent:S", "slows"}};
+            CHECK(o3->run_agenda(ad, dpool), "silent: run agenda");
+            CHECK(o3->wait_until_done("ads", 30000) == Orchestrator::Verdict::Done,
+                  "silent: the task completes instead of failing as having no provider");
+            Agenda ds = o3->snapshot("ads");
+            CHECK(ds.tasks.size() == 1 && ds.tasks[0].state == TaskState::Done && ds.tasks[0].attempts == 1 &&
+                      ds.tasks[0].result.find("done:") == 0,
+                  "silent: the late result was credited (not thrown away, not re-run)");
+            delete o3;
+        }
+    }
+    unsetenv("HC_TASK_DEADLINE_MS");
+    unsetenv("HC_LLM_CALL_TOTAL_MS");
+
     sup->shutdown();
     delete sup;
     broker->stop();

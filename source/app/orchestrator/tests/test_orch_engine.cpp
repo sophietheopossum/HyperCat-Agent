@@ -402,6 +402,178 @@ int main()
         CHECK(r.empty() && e.active_count() == 1, "a duplicate active id is rejected");
     }
 
+    /* --- the phantom "no agent provides capability": a SLOW (alive) provider overrunning the deadline
+     *     must not make its capability look unprovided. Two research tasks, one research worker. --- */
+    {
+        uint64_t fake = 1000;
+        Engine   e([&fake]() -> uint64_t { return fake; });
+        e.set_task_deadline_ms(100);
+        e.add_agenda(mkagenda("ag", {mk("t1", "research"), mk("t2", "research")}));
+        auto r = e.worker_ready("agent:A", "research");
+        CHECK(assignee_of(r, "t1") == "agent:A", "slow: t1 -> A");
+        e.on_ack("ag", "t1");
+        fake = 1200; /* A is still working, but past the deadline */
+        r = e.check_deadlines();
+        CHECK(agenda_find(*e.find_agenda("ag"), "t1")->state == TaskState::Pending, "slow: t1 taken back");
+        CHECK(count_assign(r) == 0, "slow: the overran worker is NOT handed work while it is still busy");
+        r = e.fail_unrunnable();
+        const Task *t2 = agenda_find(*e.find_agenda("ag"), "t2");
+        CHECK(t2->state == TaskState::Pending && !has_failed(r),
+              "slow: an overran-but-alive provider still counts, so research tasks are NOT failed as unprovided");
+        std::string aid, tid;
+        CHECK(e.overran_assignment("agent:A", aid, tid) && aid == "ag" && tid == "t1",
+              "slow: the engine remembers what the overran worker was doing");
+        CHECK(e.overran_workers().size() == 1, "slow: A is listed for the driver's liveness poll");
+
+        /* its late result is credited, since t1 was still waiting for someone */
+        r = e.on_late_result("agent:A", "t1", true, "the finding");
+        const Task *t1 = agenda_find(*e.find_agenda("ag"), "t1");
+        CHECK(t1->state == TaskState::Done && t1->result == "the finding",
+              "late: the finished result of a still-waiting task is credited, not thrown away");
+        CHECK(assignee_of(r, "t2") == "agent:A", "late: the freed worker picks up the next task");
+        CHECK(e.overran_workers().empty(), "late: A is no longer overran");
+    }
+
+    /* --- a late result for a task that was re-dispatched meanwhile only frees the worker --- */
+    {
+        uint64_t fake = 1000;
+        Engine   e([&fake]() -> uint64_t { return fake; });
+        e.set_task_deadline_ms(100);
+        e.add_agenda(mkagenda("ag", {mk("t1", "dev")}));
+        e.worker_ready("agent:A", "dev");
+        e.on_ack("ag", "t1");
+        fake = 1200;
+        e.check_deadlines();
+        auto r = e.worker_ready("agent:B", "dev");
+        CHECK(assignee_of(r, "t1") == "agent:B", "redispatch: the taken-back task goes to the idle B");
+        e.on_ack("ag", "t1");
+        r = e.on_late_result("agent:A", "t1", true, "stale");
+        const Task *t1 = agenda_find(*e.find_agenda("ag"), "t1");
+        CHECK(t1->state == TaskState::Running && t1->assignee == "agent:B",
+              "redispatch: A's late result does not steal B's task");
+        CHECK(e.overran_workers().empty(), "redispatch: A is freed anyway");
+    }
+
+    /* --- progress restarts the deadline: the deadline measures silence, not run time --- */
+    {
+        uint64_t fake = 1000;
+        Engine   e([&fake]() -> uint64_t { return fake; });
+        e.set_task_deadline_ms(100);
+        e.add_agenda(mkagenda("ag", {mk("t1", "dev")}));
+        e.worker_ready("agent:A", "dev");
+        e.on_ack("ag", "t1");
+        fake = 1090;
+        e.note_progress("agent:A");
+        fake = 1150; /* 150 ms since assign, but only 60 since progress */
+        e.check_deadlines();
+        CHECK(agenda_find(*e.find_agenda("ag"), "t1")->state == TaskState::Running,
+              "progress: a worker that reported progress is not taken off its task");
+        fake = 1300; /* 210 ms of silence */
+        e.check_deadlines();
+        CHECK(agenda_find(*e.find_agenda("ag"), "t1")->state == TaskState::Pending,
+              "progress: silence past the deadline still takes the task back");
+    }
+
+    /* --- an overran worker silent for a SECOND deadline is dropped, and the reason says so --- */
+    {
+        uint64_t fake = 1000;
+        Engine   e([&fake]() -> uint64_t { return fake; });
+        e.set_task_deadline_ms(100);
+        e.set_max_attempts(3);
+        e.add_agenda(mkagenda("ag", {mk("t1", "research")}));
+        e.worker_ready("agent:A", "research");
+        e.on_ack("ag", "t1");
+        fake = 1200;
+        e.check_deadlines(); /* overran */
+        fake = 1250;
+        e.check_deadlines();
+        CHECK(e.overran_workers().size() == 1, "silent: still kept within its second deadline");
+        fake = 1350;
+        e.check_deadlines(); /* 150 ms silent since overrunning */
+        CHECK(e.overran_workers().empty(), "silent: dropped after a second silent deadline");
+        auto r = e.fail_unrunnable();
+        const Task *t1 = agenda_find(*e.find_agenda("ag"), "t1");
+        CHECK(has_failed(r) && t1->state == TaskState::Failed, "silent: with no provider left the agenda settles");
+        CHECK(t1->result.find("went silent past the task deadline") != std::string::npos
+                  && t1->result.find("agent:A") != std::string::npos,
+              "silent: the reason names the dropped worker instead of claiming none was ever there");
+    }
+
+    /* --- a late result belongs to ONE admission: after the agenda is cancelled and re-run under the same id
+     *     (the UI always uses "ui-agenda"), the old run's result must not complete the new run's "t1" --- */
+    {
+        uint64_t fake = 1000;
+        Engine   e([&fake]() -> uint64_t { return fake; });
+        e.set_task_deadline_ms(100);
+        e.add_agenda(mkagenda("ag", {mk("t1", "research")}));
+        e.worker_ready("agent:A", "research");
+        e.on_ack("ag", "t1");
+        fake = 1200;
+        e.check_deadlines(); /* A overran holding ag/t1 of the FIRST admission */
+        e.cancel_agenda("ag");
+        e.remove_agenda("ag");
+        auto r = e.add_agenda(mkagenda("ag", {mk("t1", "research")})); /* same ids, a new run */
+        CHECK(count_assign(r) == 0, "reuse: A is still busy with the old run");
+        r = e.on_late_result("agent:A", "t1", true, "the OLD run's work");
+        const Task *t1 = agenda_find(*e.find_agenda("ag"), "t1");
+        CHECK(t1->state != TaskState::Done && t1->result != "the OLD run's work",
+              "reuse: the old run's late result is not credited to the new run's task");
+        CHECK(assignee_of(r, "t1") == "agent:A", "reuse: A is freed and takes the new run's t1 for real");
+    }
+
+    /* --- a verifier left over when a tally settles early (quorum reached first) is held busy until its own
+     *     late verdict — then freed, so a task waiting on its role runs instead of hanging --- */
+    {
+        Engine e;
+        e.set_default_verify({VerifyMode::Sibling, 2, 1}); /* two verifiers, quorum one */
+        e.add_agenda(mkagenda("ag", {mk("t1", "dev"), mk("t2", "qa", {"t1"})}));
+        e.worker_ready("agent:W", "dev");
+        e.worker_ready("agent:V", "dev");
+        e.worker_ready("agent:Q", "qa");
+        e.on_ack("ag", "t1");
+        auto r = e.on_result("ag", "t1", true, "built");
+        CHECK(agenda_find(*e.find_agenda("ag"), "t1")->state == TaskState::Verifying, "leftover: t1 Verifying");
+        std::string first, second;
+        for (auto &i : r)
+            if (i.kind == Intent::VerifyTask) (first.empty() ? first : second) = i.worker_id;
+        CHECK(!first.empty() && !second.empty(), "leftover: two verifiers were asked");
+        r = e.on_verdict("ag", "t1", first, Verdict::Uphold, "");
+        CHECK(agenda_find(*e.find_agenda("ag"), "t1")->state == TaskState::Done, "leftover: quorum 1 settles t1");
+        const bool q_left_over = (second == "agent:Q");
+        if (q_left_over)
+            CHECK(assignee_of(r, "t2").empty(), "leftover: Q is still verifying, so t2 waits rather than double-dispatch");
+        r = e.on_late_result(second, "verify:t1", true, "{\"verdict\":\"uphold\"}");
+        std::string aid, tid;
+        CHECK(!e.overran_assignment(second, aid, tid), "leftover: the late verdict frees the leftover verifier");
+        if (q_left_over)
+            CHECK(assignee_of(r, "t2") == "agent:Q", "leftover: once freed, Q picks up t2 (no permanent hang)");
+    }
+
+    /* --- a cancelled agenda's still-running worker stays busy until it actually reports --- */
+    {
+        Engine e;
+        e.add_agenda(mkagenda("a1", {mk("t1", "dev")}));
+        e.worker_ready("agent:A", "dev");
+        e.on_ack("a1", "t1");
+        e.cancel_agenda("a1");
+        auto r = e.add_agenda(mkagenda("a2", {mk("t2", "dev")}));
+        CHECK(count_assign(r) == 0, "cancel: A is still running a1's task, so it is not handed t2 yet");
+        r = e.on_late_result("agent:A", "t1", true, "done anyway");
+        CHECK(assignee_of(r, "t2") == "agent:A", "cancel: A's late result frees it for t2");
+        CHECK(agenda_find(*e.find_agenda("a1"), "t1")->state == TaskState::Failed,
+              "cancel: the cancelled task stays cancelled");
+    }
+
+    /* --- re-registering the roster (every run_agenda) must not reset a busy worker to idle --- */
+    {
+        Engine e;
+        e.add_agenda(mkagenda("ag", {mk("t1", "dev"), mk("t2", "dev")}));
+        auto r = e.worker_ready("agent:A", "dev");
+        CHECK(assignee_of(r, "t1") == "agent:A", "rereg: t1 -> A");
+        r = e.worker_ready("agent:A", "dev"); /* the driver re-readies the whole roster */
+        CHECK(count_assign(r) == 0, "rereg: a busy worker is not handed a second task");
+    }
+
     if (g_fails) {
         std::fprintf(stderr, "orch_engine: %d check(s) failed\n", g_fails);
         return 1;

@@ -17,6 +17,7 @@
  *            The host wires `deep_reason` onto the bus elsewhere; this module knows nothing of it.
  */
 
+#include <functional>
 #include <string>
 
 struct hc_llm; /* opaque C handle, borrowed; created via hc_llm.h by the caller */
@@ -43,8 +44,9 @@ public:
 
     /* Run the 5-stage chain on `query`. Synchronous (a host service an agent calls over the bus);
      * returns the assembled result. On an LLM failure at any stage, returns with complete==false
-     * and the stages completed so far. */
-    ReasonResult reason(const std::string &query);
+     * and the stages completed so far. `on_stage` (optional) is called after each completed stage —
+     * a worker uses it to report task progress, since the whole chain is one long tool call. */
+    ReasonResult reason(const std::string &query, const std::function<void()> &on_stage = {});
 
 private:
     Reasoner();

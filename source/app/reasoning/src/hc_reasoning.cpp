@@ -92,7 +92,7 @@ Reasoner *Reasoner::create(::hc_llm *llm)
     return r;
 }
 
-ReasonResult Reasoner::reason(const std::string &query)
+ReasonResult Reasoner::reason(const std::string &query, const std::function<void()> &on_stage)
 {
     ReasonResult res;
     std::string  prior; /* accumulated prior-stage outputs, threaded into each next stage */
@@ -115,6 +115,7 @@ ReasonResult Reasoner::reason(const std::string &query)
         if (!p_->run_stage(s.prompt, query, prior, out)) return res; /* complete stays false */
         *s.out = out;
         prior += std::string(s.name) + ":\n" + out + "\n\n";
+        if (on_stage) on_stage();
     }
     res.answer = res.synthesize;  /* the synthesized answer */
     res.confidence = res.reflect; /* the calibrated reliability summary */

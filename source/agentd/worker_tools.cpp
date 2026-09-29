@@ -424,7 +424,9 @@ char *deep_reason_invoke(const char *args_json, void *user)
     if (query.empty()) return dup_str("error: deep_reason needs a non-empty query");
     hc::Reasoner *r = hc::Reasoner::create(ctx->llm);
     if (!r) return dup_str("error: reasoner init failed");
-    hc::ReasonResult res = r->reason(query);
+    /* Five sequential model calls inside ONE tool call: report progress between them, or a healthy chain
+     * could outlast the task deadline without the orchestrator hearing anything. */
+    hc::ReasonResult res = r->reason(query, [] { hc::progress_ping(0); });
     delete r;
     std::string chain = format_reason(res);
     if (chain.size() > 240u * 1024) chain.resize(240u * 1024); /* keep the pub + result within a frame */

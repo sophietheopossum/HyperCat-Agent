@@ -84,6 +84,10 @@ public:
     bool launch_one(const std::string &id);
     void reap_one(const std::string &id);
 
+    /* Why package `id` was not launched the last time it was tried ("" if it was, or never has been) — e.g. its
+     * files changed since the operator approved them. Surfaced in the Tools panel; previously stderr only. */
+    std::string refusal(const std::string &id) const;
+
 private:
     ToolHost();
     struct Impl;

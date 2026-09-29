@@ -313,9 +313,22 @@ struct ToolHost::Impl {
     std::string    launcher_path; /* hc_tool_launch (sibling of the host) — the managed-runtime jailer; if "" a
                                    * managed tool cannot launch (native tools are unaffected) */
 
-    mutable std::mutex                mu; /* guards tools / fn_to_tool / pending */
+    mutable std::mutex                mu; /* guards tools / fn_to_tool / pending / refusals */
     std::map<std::string, ToolProc>   tools;      /* bus id "tool:<id>" -> proc */
     std::map<std::string, std::string> fn_to_tool; /* function name -> bus id   */
+    /* package id -> why its last launch was refused. The reasons used to go to stderr only, which a desktop
+     * launch discards, so a tool the operator had enabled could stay down for weeks with the panel still
+     * saying "enabled". Cleared by the next successful launch. */
+    std::map<std::string, std::string> refusals;
+
+    /* Record (and log) why `id` did not launch; returns false so a refusal site can `return refuse(...)`. */
+    bool refuse(const std::string &id, const std::string &why)
+    {
+        std::fprintf(stderr, "toolhost: tool '%s' not launched: %s\n", id.c_str(), why.c_str());
+        std::lock_guard<std::mutex> lk(mu);
+        refusals[id] = why;
+        return false;
+    }
 
     struct Pending {
         std::string worker;
@@ -395,34 +408,33 @@ bool ToolHost::Impl::launch_package(const std::string &id)
     std::string busid = "tool:" + id;
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (disabled.load() || tools.count(busid)) return false; /* kill-switch armed, or already running */
+        if (tools.count(busid)) return false; /* already running */
+        if (disabled.load()) {                /* kill-switch armed (latched for this process) */
+            refusals[id] = "third-party tools were switched off this session — restart HyperCat to launch it";
+            return false;
+        }
     }
     std::string dir = tools_root + "/" + id;
     size_t      mlen = 0;
     char       *mbuf = hc_fs_read_file((dir + "/manifest.json").c_str(), 64u * 1024, &mlen);
-    if (!mbuf) {
-        std::fprintf(stderr, "toolhost: tool '%s' has no readable manifest — skipped\n", id.c_str());
-        return false;
-    }
+    if (!mbuf) return refuse(id, "no readable manifest.json");
     ToolManifest man;
     std::string  err;
     bool         ok = tool_manifest_parse(mbuf, mlen, id, man, err);
     /* supply-chain pin: recompute the manifest+package tree hash while we still hold the manifest bytes. */
     std::string want_lock = ok ? tool_lock_hex(dir, mbuf, mlen) : std::string();
     free(mbuf);
-    if (!ok) {
-        std::fprintf(stderr, "toolhost: tool '%s' manifest rejected: %s\n", id.c_str(), err.c_str());
-        return false;
-    }
+    if (!ok) return refuse(id, "manifest rejected: " + err);
     /* refuse a tool whose bytes don't match its operator-approved manifest.lock (or that has none). The install
      * flow (Wave E) writes the lock at operator approval; a mismatch means the bytes changed since — a tripwire
      * that must re-prompt the operator, never silently run the new bytes. */
     std::string have_lock = read_tool_lock(dir);
-    if (want_lock.empty() || have_lock.empty() || want_lock != have_lock) {
-        std::fprintf(stderr, "toolhost: tool '%s' REFUSED — manifest.lock %s (supply-chain pin)\n", id.c_str(),
-                     have_lock.empty() ? "missing (not operator-approved)" : "mismatch (bytes changed since approval)");
-        return false;
-    }
+    if (want_lock.empty()) /* no pin can be computed, so nothing could ever be approved: not an approval issue */
+        return refuse(id, "its package could not be hashed (over 64 MiB, an unreadable file, or a file that is "
+                          "not a regular file)");
+    if (have_lock.empty() || want_lock != have_lock)
+        return refuse(id, have_lock.empty() ? "not approved yet (no manifest.lock)"
+                                            : "its files changed since you approved it (manifest.lock mismatch)");
     std::string token = gen_token();
     if (token.empty()) return false;
 
@@ -442,14 +454,10 @@ bool ToolHost::Impl::launch_package(const std::string &id)
     if (man.runtime == ToolRuntime::Managed) {
         std::string interp = resolve_system_interpreter(man.interpreter);
         if (interp.empty()) {
-            std::fprintf(stderr, "toolhost: tool '%s' managed interpreter '%s' not found in a system bindir — skipped\n",
-                         id.c_str(), man.interpreter.c_str());
-            return false;
+            return refuse(id, "its interpreter '" + man.interpreter + "' is not installed in a system bindir");
         }
         if (launcher_path.empty()) { /* no jailer resolved => fail closed (never run a managed tool unconfined) */
-            std::fprintf(stderr, "toolhost: tool '%s' is managed but no launcher is configured — skipped\n",
-                         id.c_str());
-            return false;
+            return refuse(id, "it needs the tool launcher, which is not available");
         }
         exe = launcher_path;
         args.push_back("--pkg"); /* the launcher's jail config (consumed before the `--` separator) */
@@ -484,8 +492,7 @@ bool ToolHost::Impl::launch_package(const std::string &id)
 
     long pid = spawn_tool(exe, args, token);
     if (pid < 0) {
-        std::fprintf(stderr, "toolhost: tool '%s' failed to spawn (%s)\n", id.c_str(), exe.c_str());
-        return false;
+        return refuse(id, "failed to start (" + exe + ")");
     }
     if (broker) broker->authorize_id(busid, pid); /* bind the id to this pid (id-squat floor) */
     {
@@ -496,6 +503,7 @@ bool ToolHost::Impl::launch_package(const std::string &id)
         proc.pid = pid;
         tools[busid] = std::move(proc);
         for (const auto &fn : man.tools) fn_to_tool[fn.name] = busid;
+        refusals.erase(id); /* it launched: whatever blocked it before is gone */
     }
     std::fprintf(stderr, "toolhost: launched tool '%s' (pid %ld, %zu function(s))\n", id.c_str(), pid,
                  man.tools.size());
@@ -768,6 +776,14 @@ void ToolHost::disable_all_live()
     if (!p_) return;
     p_->disabled.store(true); /* set FIRST so the recv loop stops confirming/forwarding before we reap */
     p_->reap_all();           /* SIGTERM/SIGKILL each tool, revoke its id, clear the registry (idempotent vs ~) */
+}
+
+std::string ToolHost::refusal(const std::string &id) const
+{
+    if (!p_) return std::string();
+    std::lock_guard<std::mutex> lk(p_->mu);
+    auto it = p_->refusals.find(id);
+    return it == p_->refusals.end() ? std::string() : it->second;
 }
 
 bool ToolHost::launch_one(const std::string &id)

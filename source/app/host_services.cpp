@@ -1467,7 +1467,18 @@ void fill_third_party_tools(hc::ui::UiSnapshot &s, const HostServices &svc)
         r.manifest.egress_hosts = man.egress_hosts; /* declared intent; unrestricted at the floor (see DISCLAIMER) */
         r.manifest.exec_paths = man.exec_allow;     /* empty in v1 (exec rejected at install) */
         r.manifest.resource_limits = tool_limits_str(man);
-        r.manifest.source = running.count("tool:" + id) ? "installed (running)" : "installed";
+        if (running.count("tool:" + id)) {
+            r.manifest.source = "installed (running)";
+        } else {
+            /* Enabled but not running usually means the ToolHost refused it; say why, or the row reads as
+             * healthy while the tool never reaches a worker (a changed-files pin mismatch did exactly that). */
+            std::string why = (r.enabled && svc.toolhost) ? svc.toolhost->refusal(id) : std::string();
+            r.manifest.source = why.empty() ? std::string("installed")
+                                            : "installed, NOT RUNNING: " + why +
+                                                  (why.find("approved") != std::string::npos
+                                                       ? " (turn it off and on again to re-approve)"
+                                                       : "");
+        }
         r.manifest.version = man.version;
         s.tools.push_back(std::move(r));
     }
@@ -2644,15 +2655,19 @@ std::string run_live_loop(hc::ui::UiApp &ui, Orchestrator &orch_, Supervisor &su
                             bool locked = priv && write_tool_lock(svc.tools_root, c.a);
                             if (!locked) {
                                 notice = "tool '" + c.a +
-                                         "': could not approve (no host-private install root / bad id / lock write failed) — not enabled";
+                                         "': could not approve (no host-private install root / bad id / the package "
+                                         "could not be hashed — over 64 MiB, an unreadable or non-regular file / lock "
+                                         "write failed) — not enabled";
                             } else {
                                 svc.settings->settings.thirdparty_tools[c.a] = true;
                                 settings_validate(svc.settings->settings);
                                 settings_save(svc.settings->settings, svc.settings->path.c_str());
                                 bool up = svc.toolhost && svc.settings->settings.thirdparty_tools_enabled
                                           && svc.toolhost->launch_one(c.a);
-                                notice = up ? "tool '" + c.a + "' enabled + launched"
-                                            : "tool '" + c.a + "' enabled (launches on next start)";
+                                std::string why = (!up && svc.toolhost) ? svc.toolhost->refusal(c.a) : std::string();
+                                notice = up            ? "tool '" + c.a + "' enabled + launched"
+                                         : why.empty() ? "tool '" + c.a + "' enabled (launches on next start)"
+                                                       : "tool '" + c.a + "' enabled, but NOT running: " + why;
                             }
                         } else {
                             svc.settings->settings.thirdparty_tools[c.a] = false;

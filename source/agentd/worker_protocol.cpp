@@ -112,6 +112,7 @@ bool await_reply_patient(BusClient &bus, uint64_t want, long total_ms, Message *
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
         if (await_reply(bus, want, kSliceMs, out)) return true; /* the operator decided */
+        progress_ping(15000); /* waiting on the operator is not being stuck: keep the task deadline at bay */
         /* the slice returned with no verdict: distinguish "still waiting" (connected) from "the host went away"
          * (closed) — the latter must NOT busy-spin and is not a deny-by-design, just an unreachable gate. */
         if (!bus.alive()) return false;
@@ -129,6 +130,48 @@ bool ping_peer(BusClient &bus, const std::string &peer, uint64_t inner_corr)
 {
     if (!bus.send_request(peer, inner_corr, "{\"cmd\":\"ping\"}")) return false;
     return await_reply(bus, inner_corr, 2000);
+}
+
+namespace {
+struct TaskProgress {
+    BusClient      *bus = nullptr;
+    std::string     to;
+    std::string     task_id;
+    uint64_t       *corr = nullptr;
+    struct timespec last = {0, 0};
+};
+TaskProgress g_progress; /* single-threaded worker: at most one running task */
+} // namespace
+
+void progress_begin(BusClient &bus, const std::string &to, const std::string &task_id, uint64_t *corr)
+{
+    g_progress.bus = &bus;
+    g_progress.to = to;
+    g_progress.task_id = task_id;
+    g_progress.corr = corr;
+    clock_gettime(CLOCK_MONOTONIC, &g_progress.last); /* the assign itself counts as the first sign of life */
+}
+
+void progress_end() { g_progress = TaskProgress(); }
+
+void progress_ping(long min_gap_ms)
+{
+    if (!g_progress.bus || !g_progress.corr || g_progress.to.empty()) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long since = (now.tv_sec - g_progress.last.tv_sec) * 1000 + (now.tv_nsec - g_progress.last.tv_nsec) / 1000000;
+    if (since < min_gap_ms) return;
+    g_progress.last = now;
+    hc_json *o = hc_json_new_object();
+    if (!o) return;
+    hc_json_obj_set_str(o, "cmd", "task.progress");
+    hc_json_obj_set_str(o, "task_id", g_progress.task_id.c_str());
+    char *s = hc_json_print(o, false);
+    hc_json_free(o);
+    if (!s) return;
+    /* A req with a fresh corr so it can never be mistaken for the reply an in-flight wait is watching for. */
+    g_progress.bus->send_request(g_progress.to, ++(*g_progress.corr), s);
+    free(s);
 }
 
 std::string task_result_body(const std::string &task_id, bool ok, const std::string &payload)

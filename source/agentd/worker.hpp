@@ -42,6 +42,11 @@ struct WorkerConfig {
     std::string id;            /* this worker's bus id, e.g. "agent:A"                         */
     int         token_fd;      /* inherited fd to read the one-time spawn token; <0 = none     */
     bool        crash_on_task = false; /* test fault injection: _exit on a task.assign         */
+    /* Test fault injection for the task deadline (offline echo path only): take this long over each task,
+     * either reporting task.progress along the way (a slow but healthy worker) or silently (a slow worker
+     * whose task is taken back at the deadline and whose late result should still be credited). */
+    int         slow_task_ms = 0;
+    bool        slow_task_silent = false;
     /* The only bus id permitted to send task.assign (the orchestrator). The host sets it; a
      * non-empty value is enforced so a same-uid peer cannot inject a task/prompt or spend model
      * budget. Empty (the default) leaves assignment open — for lower-level tests that drive a

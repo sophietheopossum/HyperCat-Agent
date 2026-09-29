@@ -31,7 +31,8 @@ void usage(const char *argv0)
                  "usage: %s --sock <path> --id <agent:id> [--token-fd <n>] [--controller <id>]\n"
                  "          [--role <r>] [--role-prompt <text>] [--role-tools <csv>]\n"
                  "          [--model <m>] [--base-url <u>] [--workspace <dir>] [--sessions <dir>]\n"
-                 "          [--egress-allow <ip>]... [--crash-on-task]\n",
+                 "          [--egress-allow <ip>]... [--crash-on-task]\n"
+                 "          [--slow-task-ms <n> | --silent-slow-task-ms <n>]   (test fault injection)\n",
                  argv0);
 }
 
@@ -105,6 +106,11 @@ int main(int argc, char **argv)
     cfg.id = id;
     cfg.token_fd = parse_fd(token_fd); /* validated; -1 when absent or garbage */
     cfg.crash_on_task = has_flag(argc, argv, "--crash-on-task");
+    if (const char *v = opt(argc, argv, "--slow-task-ms")) cfg.slow_task_ms = std::atoi(v);
+    if (const char *v = opt(argc, argv, "--silent-slow-task-ms")) {
+        cfg.slow_task_ms = std::atoi(v);
+        cfg.slow_task_silent = true;
+    }
     if (controller) cfg.controller_id = controller;
     if (role) cfg.role = role;
     if (role_prompt) cfg.role_prompt = role_prompt;

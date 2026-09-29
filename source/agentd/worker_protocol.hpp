@@ -54,6 +54,17 @@ bool ping_peer(BusClient &bus, const std::string &peer, uint64_t inner_corr);
 /* Build a task.result request body — the worker's report back to the orchestrator. */
 std::string task_result_body(const std::string &task_id, bool ok, const std::string &payload);
 
+/* Task progress (task.progress): while a task runs, tell the orchestrator that assigned it the worker is still
+ * alive and moving, so its deadline measures SILENCE rather than total run time. A long research task is
+ * legitimately many model turns plus operator approvals; without this, a healthy worker was taken off its task
+ * at the deadline. Fire-and-forget: the orchestrator does not reply. run_task brackets one task with
+ * progress_begin/progress_end (the worker is single-threaded, so there is only ever one); progress_ping sends
+ * at most one message per `min_gap_ms` and is a no-op outside a task. Called after each model turn and on each
+ * slice of a patient approval wait. */
+void progress_begin(BusClient &bus, const std::string &to, const std::string &task_id, uint64_t *corr);
+void progress_end();
+void progress_ping(long min_gap_ms);
+
 } // namespace hc
 
 #endif /* HC_AGENTD_WORKER_PROTOCOL_HPP */

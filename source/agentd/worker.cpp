@@ -90,6 +90,8 @@ struct TaskCtx {
     std::vector<std::string> exec_read_roots; /* named in the run tool's description (the host enforces them) */
     std::string skills_catalog;       /* W6 P6.2: the host-built fenced catalog, appended after the role overlay */
     hc_sandbox *skills_sb = nullptr;  /* W6 P6.2: the jailed skills/ root for the load_skill tool (null => off) */
+    int         slow_task_ms = 0;     /* test fault injection (offline only): see WorkerConfig::slow_task_ms */
+    bool        slow_task_silent = false;
 };
 
 /* Per-turn data captured during a real agent run (via the on_turn observer), buffered until the session
@@ -110,6 +112,7 @@ struct AgentObsCtx {
 void obs_on_text(const char *delta, size_t n, void *user)
 {
     token_on_text(delta, n, static_cast<AgentObsCtx *>(user)->sink); /* delegate to the token streamer */
+    progress_ping(15000); /* a long streamed reply is progress too (throttled: this runs per delta) */
 }
 
 void obs_on_turn(int turn, const char *input, const char *assistant, const char *tool_calls,
@@ -119,6 +122,7 @@ void obs_on_turn(int turn, const char *input, const char *assistant, const char 
     c->turns->push_back({turn, input ? input : "", assistant ? assistant : "",
                          tool_calls ? tool_calls : "", tool_results ? tool_results : "",
                          finish ? finish : ""});
+    progress_ping(1000); /* a finished model turn is the plainest sign the task is moving */
 }
 
 /* Persist one finished task as a session (the user prompt + the assistant result) for the host's session
@@ -266,8 +270,9 @@ This says nothing about whether to use emoji; but if one does turn up, make it a
  * assistant's final text, or a typed error string (recorded as the result). */
 std::string run_agent_task(const TaskCtx &tc, const std::string &title, const std::string &desc,
                            const std::string &capability, const std::string &artifact_path, BusClient &bus,
-                           uint64_t *corr, std::vector<ManifestTurn> &turns, CapStore *caps)
+                           uint64_t *corr, std::vector<ManifestTurn> &turns, CapStore *caps, bool *ok_out)
 {
+    if (ok_out) *ok_out = true;
     if (capability == "verify") return run_verify_turn(tc, desc, bus, turns); /* P04 skeptic branch */
     /* W2.5: APPEND the role overlay after the base — never prepend (would shatter the shared cache prefix).
      * W6 P6.2: then the per-project skills catalog AFTER the role overlay (host-built, already fenced+defanged) —
@@ -321,11 +326,26 @@ std::string run_agent_task(const TaskCtx &tc, const std::string &title, const st
     std::string result;
     if (st == HC_AGENT_OK && txt && *txt) {
         result = txt;
+    } else if (st == HC_AGENT_OK) {
+        /* The run finished normally but the model's last turn carried no text (a reasoning model that answers
+         * only in its reasoning channel, or an empty stop after fs_write). That is not a failure: the host's
+         * deliverable check still decides whether the task produced what it had to. */
+        result = "(the model finished without a final message)";
     } else {
+        /* Report the run as FAILED, not as a result: an "error: ..." payload sent with ok=true either passed
+         * for a finished task (no deliverable to check) or was relabelled "deliverable file is missing",
+         * hiding the real cause (e.g. the tool-iteration limit) from the operator and the retry logic. */
+        if (ok_out) *ok_out = false;
         result = std::string("error: ") + hc_agent_status_str(st);
         if (st == HC_AGENT_ERR_LLM) {
             const hc_llm_status ls = hc_agent_last_llm_status(ag);
             result += std::string(" (") + hc_llm_status_str(ls) + ")";
+        }
+        /* Keep what the model had got to (capped): a partial finding is still worth reading. */
+        if (txt && *txt) {
+            std::string partial = txt;
+            if (partial.size() > 16u * 1024) partial.resize(16u * 1024);
+            result += "\n\n[last model text before stopping]\n" + partial;
         }
     }
     hc_agent_free(ag);
@@ -368,22 +388,31 @@ void run_task(BusClient &bus, const Message &m, uint64_t *corr, const TaskCtx &t
     TaskFields t = parse_task_fields(m.body);
     bus.send_reply(m.from, m.corr, reply_body(true, "task_id", t.task_id)); /* ack: accepted/running */
 
+    progress_begin(bus, m.from, t.task_id, corr); /* task.progress to the assigner while this task runs */
     std::vector<ManifestTurn> turns; /* filled by the agent's on_turn observer (real turns only) */
     std::string               payload;
+    bool                      ok = true;
     if (tc.llm)
-        payload = run_agent_task(tc, t.title, t.desc, t.capability, t.artifact_path, bus, corr, turns, caps);
+        payload = run_agent_task(tc, t.title, t.desc, t.capability, t.artifact_path, bus, corr, turns, caps, &ok);
     else if (t.capability == "verify")
         payload = offline_verdict(t.desc); /* P04: deterministic offline verifier verdict */
-    else
+    else {
+        /* Test fault injection: a slow offline task, with or without progress along the way. */
+        for (int waited = 0; waited < tc.slow_task_ms; waited += 250) {
+            usleep(250 * 1000);
+            if (!tc.slow_task_silent) progress_ping(0);
+        }
         payload = "done: " + t.title; /* deterministic offline result */
+    }
     persist_session(tc, t, payload, turns); /* transcript + per-turn manifest for the browser/replay */
     uint64_t result_corr = ++(*corr); /* after the work, so it follows any tool reqs */
-    /* Report the result. If the send fails (host link gone, or — guarded by the payload cap — an
-     * oversized frame), don't wait on a reply that can never come; the orchestrator's per-task
-     * deadline reassigns a result that never lands. */
-    if (!bus.send_request(m.from, result_corr, task_result_body(t.task_id, true, payload)))
-        return;
-    await_reply(bus, result_corr, 2000); /* best-effort: confirm the orchestrator received it */
+    progress_end();
+    /* Report the result without waiting for its ack. The orchestrator acks only after journaling, and by then
+     * it may already have sent this (now free) worker its next task.assign — which a wait here would decline
+     * as "busy", burning one of that task's attempts. The ack carries nothing we act on (it arrives later as an
+     * unrelated reply, which the main loop ignores). A send that fails (host link gone, or an oversized frame
+     * despite the payload cap) is recovered by the orchestrator's per-task deadline. */
+    bus.send_request(m.from, result_corr, task_result_body(t.task_id, ok, payload));
 }
 
 /* The recv/dispatch loop. Returns a process exit code: 0 on a clean shutdown, 7 if the bus drops.
@@ -723,6 +752,8 @@ int run_worker(const WorkerConfig &cfg)
     tc.role_prompt = cfg.role_prompt;
     tc.toolset = parse_role_tools(cfg.role_tools);
     tc.exec_enabled = cfg.exec_enabled;
+    tc.slow_task_ms = cfg.slow_task_ms;
+    tc.slow_task_silent = cfg.slow_task_silent;
     tc.exec_read_roots = cfg.exec_read_roots;
     tc.skills_catalog = cfg.skills_catalog; /* W6 P6.2: appended to the prompt; load_skill reads from skills_sb */
     tc.skills_sb = skills_sb;

@@ -74,8 +74,24 @@ public:
     /* Pool management (the driver tells the engine who can run work — the pool is SHARED across agendas).
      * Each returns the intents to act on now (a new idle worker may unblock pending tasks in any agenda; a
      * lost worker's in-flight task is reassigned within its own agenda to a survivor). */
+    /* worker_ready adds a worker, or only refreshes the role of one already known (never resetting a worker
+     * that is still busy). worker_lost forgets it for good. */
     std::vector<Intent> worker_ready(const std::string &id, const std::string &role);
     std::vector<Intent> worker_lost(const std::string &id);
+
+    /* The worker reported progress on what it is doing (task.progress): restart that task's deadline, so the
+     * deadline measures silence rather than total run time. Never schedules anything. */
+    std::vector<Intent> note_progress(const std::string &id);
+
+    /* Overran workers (see check_deadlines) hold nothing but are still busy providers. The driver routes their
+     * late task.result here: `overran_assignment` names what the worker was doing when its work was taken back
+     * (task id, or "verify:<task>"), and `on_late_result` frees the worker and credits an ok result if that task
+     * is still Pending. `overran_workers` lists them for the driver's liveness poll. */
+    bool                     overran_assignment(const std::string &worker, std::string &agenda_id,
+                                                std::string &task_id) const;
+    std::vector<Intent>      on_late_result(const std::string &worker, const std::string &task_id, bool ok,
+                                            const std::string &payload);
+    std::vector<std::string> overran_workers() const;
 
     /* Drive the schedule: assign dispatchable tasks across ALL active agendas to idle role-matching
      * workers (round-robin across agendas for fairness), and emit each settled agenda's terminal verdict

@@ -125,11 +125,42 @@ struct Orchestrator::Impl {
     void                settle_agenda(const std::string &agenda_id, bool failed);
     std::vector<Intent> poll_liveness(); /* returns intents (does NOT send) so the loop can order them */
     void                publish_active();
+    void check_deliverable(const std::string &worker, const std::string &agenda_id, const std::string &task_id,
+                           bool &ok, std::string &payload);
 
     void journal_open(const std::string &agenda_id);
     void journal_transitions();
     void retain_settled(const std::string &agenda_id, const Agenda &final_state, Verdict v);
 };
+
+/* W1.3: reconcile a task.result with the task's declared deliverable file (the host checks the file itself). A
+ * claimed success without the file becomes a failure with a clear reason, so the retry machinery re-prompts
+ * the worker and the agenda never reports a false Done. A reported FAILURE whose file is there anyway (the run
+ * hit the iteration limit or a model error after writing it) is credited as done, with the cause kept in the
+ * result: the work the task existed for was delivered. */
+void Orchestrator::Impl::check_deliverable(const std::string &worker, const std::string &agenda_id,
+                                           const std::string &task_id, bool &ok, std::string &payload)
+{
+    DeliverableVerifier verifier;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        verifier = deliverable_verifier;
+    }
+    if (!verifier) return;
+    const Agenda *a = engine->find_agenda(agenda_id);
+    const Task   *t = a ? agenda_find(*a, task_id) : nullptr;
+    if (!t || t->artifact_path.empty()) return;
+    const bool present = verifier(worker, t->artifact_path);
+    if (ok && !present) {
+        ok = false;
+        payload = "claimed complete but the deliverable file '" + t->artifact_path +
+                  "' is missing or empty in the workspace\n\n[original claim]\n" + payload;
+    } else if (!ok && present) {
+        ok = true;
+        payload = "[the run stopped with an error after writing its deliverable '" + t->artifact_path +
+                  "', which is kept]\n\n" + payload;
+    }
+}
 
 /* ---- P14 journaling (driver-thread only; a no-op when the agenda has no WAL) ---- */
 
@@ -384,6 +415,10 @@ std::vector<Intent> Orchestrator::Impl::poll_liveness()
                 && !sup->is_alive(t.assignee))
                 dead.insert(t.assignee);
     }
+    /* An overran worker holds no task, so the scan above cannot see it — but it is still counted as a
+     * provider, so if it dies it must be dropped or its capability would wait on it forever. */
+    for (const auto &w : engine->overran_workers())
+        if (!sup->is_alive(w)) dead.insert(w);
     for (const auto &w : dead) {
         auto r = engine->worker_lost(w);
         out.insert(out.end(), r.begin(), r.end());
@@ -443,7 +478,16 @@ void Orchestrator::Impl::driver_loop()
                      * has no assignment, so its result is dropped; it cannot complete another's task. */
                     std::string aid, atid;
                     bool        is_verify = false;
-                    if (tr.valid && engine->worker_assignment(m.from, aid, atid, is_verify)) {
+                    if (tr.valid && !engine->worker_assignment(m.from, aid, atid, is_verify)
+                        && engine->overran_assignment(m.from, aid, atid)) {
+                        /* A worker whose task was taken back at the deadline finished anyway. Free it, and
+                         * credit the result if the task is still waiting — after the same deliverable check a
+                         * punctual result gets. */
+                        bool        rok = tr.ok;
+                        std::string payload = tr.payload;
+                        if (tr.task_id == atid) check_deliverable(m.from, aid, atid, rok, payload);
+                        apply(engine->on_late_result(m.from, tr.task_id, rok, payload));
+                    } else if (tr.valid && engine->worker_assignment(m.from, aid, atid, is_verify)) {
                         if (is_verify && tr.task_id == "verify:" + atid) {
                             codec::VerdictMsg vm = codec::parse_verdict(tr.payload);
                             apply(engine->on_verdict(aid, atid, m.from, verdict_from_str(vm.verdict),
@@ -456,27 +500,15 @@ void Orchestrator::Impl::driver_loop()
                              * never reports a false Done. The verifier does the (host-side) filesystem check. */
                             bool        rok = tr.ok;
                             std::string payload = tr.payload;
-                            if (rok) {
-                                DeliverableVerifier verifier;
-                                {
-                                    std::lock_guard<std::mutex> lk(mu);
-                                    verifier = deliverable_verifier;
-                                }
-                                if (verifier) {
-                                    const Agenda *a = engine->find_agenda(aid);
-                                    const Task   *t = a ? agenda_find(*a, atid) : nullptr;
-                                    if (t && !t->artifact_path.empty() && !verifier(m.from, t->artifact_path)) {
-                                        rok = false;
-                                        payload = "claimed complete but the deliverable file '" +
-                                                  t->artifact_path + "' is missing or empty in the workspace\n\n"
-                                                  "[original claim]\n" +
-                                                  tr.payload;
-                                    }
-                                }
-                            }
+                            check_deliverable(m.from, aid, atid, rok, payload);
                             apply(engine->on_result(aid, atid, rok, payload));
                         }
                     }
+                } else if (codec::body_cmd(m.body) == "task.progress") {
+                    /* A worker mid-task saying it is alive and moving (after each model turn, and while it
+                     * waits on an operator approval): restart its deadline. Fire-and-forget — the worker
+                     * never waits for a reply, so none is sent. */
+                    apply(engine->note_progress(m.from));
                 } else {
                     bus->send_reply(m.from, m.corr, codec::ack_body(false)); /* unknown cmd */
                 }

@@ -41,8 +41,8 @@ int main()
           "generalist carries the write tools (dev-equivalent)");
     CHECK(dev && has_tool(*dev, RoleTool::FsWrite) && has_tool(*dev, RoleTool::FsUpdate),
           "dev carries the write tools");
-    CHECK(research && !has_tool(*research, RoleTool::FsWrite) && !has_tool(*research, RoleTool::FsUpdate),
-          "research carries NO write tools");
+    CHECK(research && has_tool(*research, RoleTool::FsWrite) && has_tool(*research, RoleTool::FsUpdate),
+          "research can write its findings (its tasks carry a deliverable file)");
     CHECK(research && has_tool(*research, RoleTool::FsRead), "research can still read");
 
     /* --- tool name <-> enum is total + the csv reflects the toolset --- */
@@ -55,8 +55,8 @@ int main()
     RoleTool junk;
     CHECK(!role_tool_from_name("not_a_tool", junk), "an unknown tool name is rejected");
     CHECK(dev && role_tools_csv(*dev).find("fs_write") != std::string::npos, "dev csv includes fs_write");
-    CHECK(research && role_tools_csv(*research).find("fs_write") == std::string::npos,
-          "research csv excludes fs_write");
+    CHECK(research && role_tools_csv(*research).find("fs_write") != std::string::npos,
+          "research csv includes fs_write");
 
     /* --- serialize <-> parse round-trip --- */
     {
@@ -69,7 +69,8 @@ int main()
         CHECK(rdev && rdev->prompt_overlay == dev->prompt_overlay, "round-trip preserves the overlay");
         CHECK(rdev && rdev->tools.size() == dev->tools.size(), "round-trip preserves the toolset");
         const RoleDef *rres = roletable_find(rt, "research");
-        CHECK(rres && !has_tool(*rres, RoleTool::FsWrite), "round-trip preserves research's restriction");
+        CHECK(rres && has_tool(*rres, RoleTool::FsWrite) && has_tool(*rres, RoleTool::FsUpdate),
+              "round-trip preserves research's toolset");
     }
 
     /* --- P06: the fs/exec scope record (exec_allow / fs_write_paths / fs_read_paths) --- */

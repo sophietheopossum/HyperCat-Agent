@@ -232,13 +232,17 @@ RoleTable roletable_builtin_defaults()
          "file with fs_write. Report what actually fails, not what should pass.",
          {T::DeepReason, T::MemoryRecall, T::MemoryWrite, T::FsRead, T::FsList, T::FsWrite, T::FsUpdate, T::LoadSkill},
          ""});
-    /* research — investigate + synthesize; informs the build, does NOT write its code (no write tools). */
+    /* research — investigate + synthesize; informs the build, does NOT write its code. It does write its
+     * FINDINGS: the planner gives research tasks a deliverable file, the host fails a task whose file is
+     * missing, and task.assign carries no upstream results, so a file is the only way a finding reaches the
+     * tasks that depend on it. Without the write tools every research task in a plan failed. */
     t.roles.push_back(
         {"research",
          "You are the fleet's RESEARCHER. Investigate and gather: recall what the fleet already knows, reason "
-         "carefully about the hard questions, and hand back a clear, well-grounded synthesis. You inform the "
-         "build; you do not write its code.",
-         {T::DeepReason, T::MemoryRecall, T::MemoryWrite, T::FsRead, T::FsList, T::LoadSkill},
+         "carefully about the hard questions, and write a clear, well-grounded synthesis to the named "
+         "deliverable file with fs_write (or fs_update) — never paste it as the answer — then read it back to "
+         "confirm it landed. You inform the build; you do not write its code.",
+         {T::DeepReason, T::MemoryRecall, T::MemoryWrite, T::FsRead, T::FsList, T::FsWrite, T::FsUpdate, T::LoadSkill},
          ""});
     /* ops — wiring + glue + keeping things running; writes the artifacts it produces. ALL tools. */
     t.roles.push_back(

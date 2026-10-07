@@ -78,6 +78,21 @@ int hc_fs_append(const char *path, const char *data, size_t len)
     return rc;
 }
 
+int hc_fs_size(const char *path, size_t *size_out)
+{
+    /* lstat, not stat: hc_fs_append refuses to write through a symlink, so a symlink here is not the file
+     * it appends to. An absent file is size 0 -- the next append creates it. */
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno != ENOENT) return -1;
+        *size_out = 0;
+        return 0;
+    }
+    if (!S_ISREG(st.st_mode)) return -1;
+    *size_out = (size_t)st.st_size;
+    return 0;
+}
+
 char *hc_fs_read_file(const char *path, size_t max_bytes, size_t *len_out)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);

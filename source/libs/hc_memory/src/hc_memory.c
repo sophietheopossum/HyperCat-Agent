@@ -56,8 +56,10 @@ struct hc_memory {
     char       want[HC_MEM_MODEL_MAX];  /* model the CALLER configured; "" = unknown, no enforcement */
     int        mismatch;  /* 1 when model[] and want[] disagree -> writes and queries are refused   */
     int        adopted;   /* 1 when model[] was adopted retroactively, NOT recorded at first write   */
-    size_t     vec_rows;  /* physical rows in vectors.f32 (live + orphaned-by-upsert)        */
+    size_t     vec_bytes; /* vectors.f32 size; exact while appends succeed (live + orphaned rows) */
+    int        vec_torn;  /* 1 when vec_bytes is unknown: re-learn it before placing the next row */
     size_t     log_bytes; /* current records.jsonl size, to bound growth without a per-write stat */
+    int        log_torn;  /* 1 when records.jsonl may end mid-line: the next line starts with \n  */
     mem_entry *entries;   /* the live index */
     size_t     n, cap;
 };
@@ -258,6 +260,8 @@ static int rebuild(hc_memory *m)
             free(md);
         }
     }
+    /* Until vectors.f32 is read below, its size is unknown; the first write then learns it from disk. */
+    m->vec_torn = 1;
     if (m->dim <= 0) return 0; /* a store with no meta has no records yet */
 
     char vpath[1200], rpath[1200];
@@ -269,13 +273,20 @@ static int rebuild(hc_memory *m)
     char  *vecs = hc_fs_read_file(vpath, HC_MEM_VEC_MAX, &vlen);
     size_t row_bytes = (size_t)m->dim * sizeof(float);
     size_t rows = vecs ? vlen / row_bytes : 0;
-    m->vec_rows = rows;
+    /* A crash mid-append can leave a partial row at the tail; rows rounds it down, and the next write
+     * pads past it rather than appending a misaligned row. */
+    if (vecs) {
+        m->vec_bytes = vlen;
+        m->vec_torn = 0;
+    }
 
     int    rc = 0;
     size_t rlen = 0;
     char  *data = hc_fs_read_file(rpath, HC_MEM_LOG_MAX, &rlen);
     if (data) {
         m->log_bytes = rlen;
+        /* A crash mid-append leaves a fragment with no newline; the next line must not be glued to it. */
+        m->log_torn = (rlen > 0 && data[rlen - 1] != '\n') ? 1 : 0;
         for (char *p = data; *p;) {
             char  *nl = strchr(p, '\n');
             size_t llen = nl ? (size_t)(nl - p) : strlen(p);
@@ -391,6 +402,25 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
     bool exists = find_entry(m, id) != NULL;
     if (!exists && m->n >= HC_MEM_MAX_RECORDS) return -1; /* live cap (new ids only) */
 
+    char vpath[1200], rpath[1200];
+    if ((size_t)snprintf(vpath, sizeof vpath, "%s/vectors.f32", m->root) >= sizeof vpath
+        || (size_t)snprintf(rpath, sizeof rpath, "%s/records.jsonl", m->root) >= sizeof rpath)
+        return -1;
+
+    /* The vector goes on a row boundary of the PHYSICAL file, and the record names that row. A failed or
+     * interrupted append can leave part of a row, or all of one, behind without vec_bytes advancing, so
+     * the size is re-learnt then, and a partial row is padded past. Counting rows instead would point
+     * every later record at the wrong bytes once the file and the counter disagree. */
+    if (m->vec_torn) {
+        size_t sz = 0;
+        if (hc_fs_size(vpath, &sz) != 0) return -1;
+        m->vec_bytes = sz;
+        m->vec_torn = 0;
+    }
+    const size_t row_bytes = (size_t)r->dim * sizeof(float);
+    const size_t pad = (row_bytes - m->vec_bytes % row_bytes) % row_bytes;
+    const size_t row = (m->vec_bytes + pad) / row_bytes;
+
     /* build the record line first so we can bound the log before touching the vector file */
     hc_json *o = hc_json_new_object();
     if (!o) return -1;
@@ -399,19 +429,13 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
               && hc_json_obj_set_str(o, "source", r->source ? r->source : "")
               && hc_json_obj_set_double(o, "importance", r->importance)
               && hc_json_obj_set_int(o, "created_ms", (int64_t)r->created_ms)
-              && hc_json_obj_set_int(o, "row", (int64_t)m->vec_rows);
+              && hc_json_obj_set_int(o, "row", (int64_t)row);
     char *line = ok ? hc_json_print(o, false) : NULL;
     hc_json_free(o);
     if (!line) return -1;
-    size_t llen = strlen(line);
-    if (m->log_bytes + llen + 1 > HC_MEM_LOG_SOFT) { /* soft write cap; headroom left for forgets */
-        free(line);
-        return -1;
-    }
-
-    char vpath[1200], rpath[1200];
-    if ((size_t)snprintf(vpath, sizeof vpath, "%s/vectors.f32", m->root) >= sizeof vpath
-        || (size_t)snprintf(rpath, sizeof rpath, "%s/records.jsonl", m->root) >= sizeof rpath) {
+    size_t       llen = strlen(line);
+    const size_t lead = m->log_torn ? 1 : 0; /* a '\n' that ends a torn fragment on its own line */
+    if (m->log_bytes + lead + llen + 1 > HC_MEM_LOG_SOFT) { /* soft write cap; headroom left for forgets */
         free(line);
         return -1;
     }
@@ -435,25 +459,45 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
         if (m->want[0]) snprintf(m->model, sizeof m->model, "%s", m->want);
         m->adopted = now_adopted ? 1 : 0;
     }
-    /* append the vector (its physical row is m->vec_rows), then the record line referencing that row.
-     * vec_rows tracks the physical file, so a torn write leaves only a harmless orphan row. */
-    if (hc_fs_append(vpath, (const char *)r->vec, (size_t)m->dim * sizeof(float)) != 0) {
+    /* append the vector at `row` (zero padding first if a partial row is at the tail), then the record
+     * line referencing it. A failure in either can leave bytes behind; the torn flags make the next write
+     * step past them, so they stay harmless orphans and never shift or corrupt a later record. */
+    int vrc;
+    if (pad == 0) {
+        vrc = hc_fs_append(vpath, (const char *)r->vec, row_bytes);
+    } else {
+        char *vbuf = calloc(1, pad + row_bytes);
+        if (!vbuf) {
+            free(line);
+            return -1;
+        }
+        memcpy(vbuf + pad, r->vec, row_bytes);
+        vrc = hc_fs_append(vpath, vbuf, pad + row_bytes);
+        free(vbuf);
+    }
+    if (vrc != 0) {
+        m->vec_torn = 1;
         free(line);
         return -1;
     }
-    m->vec_rows++;
-    char *buf = malloc(llen + 1);
+    m->vec_bytes += pad + row_bytes;
+    char *buf = malloc(lead + llen + 1);
     if (!buf) {
         free(line);
         return -1;
     }
-    memcpy(buf, line, llen);
-    buf[llen] = '\n';
-    int rc = hc_fs_append(rpath, buf, llen + 1);
+    if (lead) buf[0] = '\n';
+    memcpy(buf + lead, line, llen);
+    buf[lead + llen] = '\n';
+    int rc = hc_fs_append(rpath, buf, lead + llen + 1);
     free(buf);
     free(line);
-    if (rc != 0) return -1;
-    m->log_bytes += llen + 1;
+    if (rc != 0) {
+        m->log_torn = 1;
+        return -1;
+    }
+    m->log_torn = 0;
+    m->log_bytes += lead + llen + 1;
 
     if (index_upsert(m, id, r->scope, r->text, r->source, r->importance, r->created_ms, r->vec) != 0)
         return -1; /* persisted but index update OOM'd — a reopen would recover it */
@@ -567,14 +611,19 @@ int hc_memory_forget(hc_memory *m, const char *id)
     if (!e) return 0; /* idempotent — already absent */
 
     char    rpath[1200], line[64];
-    int     ll = snprintf(line, sizeof line, "{\"id\":\"%s\",\"deleted\":true}\n", id);
+    int     ll = snprintf(line, sizeof line, "%s{\"id\":\"%s\",\"deleted\":true}\n",
+                          m->log_torn ? "\n" : "", id); /* the lead \n ends a torn fragment */
     if (ll < 0 || (size_t)snprintf(rpath, sizeof rpath, "%s/records.jsonl", m->root) >= sizeof rpath)
         return -1;
     /* gated by the HARD cap, not the soft write cap: a tombstone REMOVES content, so it draws on the
      * 1 MiB headroom above the write cap and is effectively never refused (live records are bounded, so
      * the total tombstone bytes are too) — remediation must not fail closed. */
     if (m->log_bytes + (size_t)ll > HC_MEM_LOG_MAX) return -1;
-    if (hc_fs_append(rpath, line, (size_t)ll) != 0) return -1;
+    if (hc_fs_append(rpath, line, (size_t)ll) != 0) {
+        m->log_torn = 1;
+        return -1;
+    }
+    m->log_torn = 0;
     m->log_bytes += (size_t)ll;
     remove_at(m, (size_t)(e - m->entries));
     /* Emptying the store LIFTS a model mismatch. The refusal exists because foreign vectors cannot be

@@ -34,6 +34,7 @@ extern "C" {
 int   hc_fs_mkdirs(const char *path);                                      /* mkdir -p, 0700          */
 int   hc_fs_atomic_write(const char *path, const char *data, size_t len);  /* temp + fsync + rename   */
 int   hc_fs_append(const char *path, const char *data, size_t len);        /* O_APPEND + fsync, 0600  */
+int   hc_fs_size(const char *path, size_t *size_out);                      /* lstat; absent -> 0      */
 /* Read `path` whole into a malloc'd, NUL-terminated buffer (*len_out = byte length). NULL on error OR
  * when the file exceeds `max_bytes` (the cap bounds host memory against an oversized/planted file). */
 char *hc_fs_read_file(const char *path, size_t max_bytes, size_t *len_out);

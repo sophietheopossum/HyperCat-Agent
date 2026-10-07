@@ -435,8 +435,15 @@ hc_sandbox_status hc_sandbox_list(hc_sandbox *s, const char *user_path, hc_sandb
     hc_sandbox_dirent *arr = NULL;
     size_t             cap = 0, n = 0;
     struct dirent     *de;
-    errno = 0;
-    while (n < HC_SANDBOX_LIST_MAX && (de = readdir(d)) != NULL) {
+    int                read_errno = 0;
+    while (n < HC_SANDBOX_LIST_MAX) {
+        /* Clear errno for readdir alone: at end-of-dir it returns NULL WITHOUT touching errno, so a value
+         * left by a skipped fstatat below would otherwise read as a directory error. */
+        errno = 0;
+        if ((de = readdir(d)) == NULL) {
+            read_errno = errno; /* 0 at end-of-dir, set on a real error */
+            break;
+        }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         if (strlen(de->d_name) >= sizeof arr[0].name) continue; /* skip a pathological over-long name */
         /* type/size via the dir's fd (dirfd(d), the POSIX accessor), NOT following a symlink leaf — a
@@ -461,7 +468,6 @@ hc_sandbox_status hc_sandbox_list(hc_sandbox *s, const char *user_path, hc_sandb
         arr[n].size = S_ISREG(est.st_mode) ? (int64_t)est.st_size : 0;
         n++;
     }
-    int read_errno = errno; /* readdir sets errno on a real error (vs 0 at end-of-dir) */
     closedir(d);            /* closes the owned fd */
     if (read_errno != 0 && n == 0) {
         free(arr);

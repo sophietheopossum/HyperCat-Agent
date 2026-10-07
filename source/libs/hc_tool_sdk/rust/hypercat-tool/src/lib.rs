@@ -67,7 +67,7 @@ fn has_flag(name: &str) -> bool {
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 /// Send one framed envelope. Omitted fields match the C SDK (no key when empty/zero). `body` is a JSON string.
@@ -241,11 +241,8 @@ pub fn serve(tools: &[(&str, ToolFn)]) -> i32 {
     // serve invokes until shutdown (or the connection drops)
     let _ = s.set_read_timeout(None);
     eprintln!("hypercat-tool {id}: serving {} function(s)", tools.len());
-    loop {
-        let (t, from, corr, body) = match recv_frame(&mut s) {
-            Ok(f) => f,
-            Err(_) => break, // host gone / bad frame
-        };
+    // an Err ends it too: the host is gone or sent a bad frame
+    while let Ok((t, from, corr, body)) = recv_frame(&mut s) {
         if t != "req" {
             continue;
         }

@@ -1,8 +1,9 @@
 /* Tests for hc_memory — fully offline (vectors are hand-crafted fixtures; no hc_llm). Covers write +
  * dedup, dim adoption + mismatch reject, the cosine query + the scope filter (an agent cannot read
  * another's scope), bounds (oversized text / non-finite vector rejected), forget, and persistence-replay
- * (close + reopen rebuilds the index from the log), and the embedding-model binding (a same-dimension
- * model swap must be refused, not silently served). Exit non-zero on any failure. */
+ * (close + reopen rebuilds the index from the log), the embedding-model binding (a same-dimension
+ * model swap must be refused, not silently served), and torn tails (a partial line or row that a crash or
+ * a failed append leaves must not corrupt later writes). Exit non-zero on any failure. */
 
 #define _DEFAULT_SOURCE 1
 
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int g_fails = 0;
@@ -251,10 +253,6 @@ static void test_model_binding(void)
     rmdir(dir);
 }
 
-/* A crash (or a failed append) mid-write leaves a partial record line or vector row at a file's tail.
- * The next write must step past it: a record glued onto a log fragment would vanish on reopen, a
- * tombstone glued onto one would bring a forgotten memory back, and a vector appended after a partial
- * row would be read back from the wrong bytes for the rest of the store's life. */
 static void append_raw(const char *dir, const char *name, const void *data, size_t len)
 {
     char path[1100];
@@ -266,6 +264,31 @@ static void append_raw(const char *dir, const char *name, const void *data, size
     fclose(f);
 }
 
+/* Put a directory where a store file was, so every append to it fails (also as root); `on` = 0 undoes it. */
+static void block_file(const char *dir, const char *name, int on)
+{
+    char path[1100], aside[1100];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    snprintf(aside, sizeof aside, "%s/%s.aside", dir, name);
+    if (on)
+        CHECK(rename(path, aside) == 0 && mkdir(path, 0700) == 0, "torn: block a store file");
+    else
+        CHECK(rmdir(path) == 0 && rename(aside, path) == 0, "torn: unblock a store file");
+}
+
+static long file_size(const char *dir, const char *name)
+{
+    char        path[1100];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    return stat(path, &st) == 0 ? (long)st.st_size : -1;
+}
+
+/* A crash (or a failed append) mid-write leaves a partial record line or vector row at a file's tail.
+ * The next write must step past it: a record glued onto a log fragment would vanish on reopen, a
+ * tombstone glued onto one would bring a forgotten memory back, and a vector appended after a partial
+ * row would be read back from the wrong bytes for the rest of the store's life. Both ways in are
+ * covered: a tail found at open, and one left by an append that failed earlier in the same session. */
 static void test_torn_tails(void)
 {
     char dir[] = "/tmp/hcmemtorn_XXXXXX";
@@ -273,26 +296,27 @@ static void test_torn_tails(void)
         CHECK(0, "mkdtemp for torn-tail test");
         return;
     }
-    const float   a[4] = {1, 0, 0, 0}, b[4] = {0, 1, 0, 0};
-    const char    frag[] = "{\"id\":\"0123456789abcdef\",\"scope\":\"s\",\"te"; /* cut before its \n */
-    const float   half[2] = {0.25f, 0.75f};                               /* half a dim-4 row     */
+    const float   a[4] = {1, 0, 0, 0}, b[4] = {0, 1, 0, 0}, c[4] = {0, 0, 1, 0}, d[4] = {0, 0, 0, 1};
+    const float   e[4] = {1, 1, 0, 0};
+    const float   half[2] = {0.25f, 0.75f};                 /* half of a dim-4 row          */
+    const char    frag[] = "{\"id\":\"0123456789abcdef\",\"te"; /* a record cut off before \n */
+    char          id_b[HC_MEM_ID_LEN] = {0}, id_c[HC_MEM_ID_LEN] = {0};
     hc_mem_hit   *hits = NULL;
     size_t        n = 0;
     hc_mem_record ra = rec("s", "alpha", a, 4, 1), rb = rec("s", "beta", b, 4, 2);
+    hc_mem_record rc = rec("s", "gamma", c, 4, 3), rd = rec("s", "delta", d, 4, 4);
+    hc_mem_record re = rec("s", "epsilon", e, 4, 5);
 
+    /* 1. a partial vector row found at open: the next row is padded past it */
     hc_memory *m = hc_memory_open(dir);
     CHECK(m && hc_memory_write(m, &ra, NULL) == 0, "torn: first write");
     hc_memory_close(m);
-
-    append_raw(dir, "records.jsonl", frag, sizeof frag - 1);
     append_raw(dir, "vectors.f32", half, sizeof half);
     m = hc_memory_open(dir);
-    CHECK(m && hc_memory_count(m) == 1, "torn: a torn tail does not cost the records before it");
-    CHECK(m && hc_memory_write(m, &rb, NULL) == 0, "torn: a write after the torn tails succeeds");
+    CHECK(m && hc_memory_write(m, &rb, id_b) == 0, "torn: a write after a partial row");
     hc_memory_close(m);
-
+    CHECK(file_size(dir, "vectors.f32") == 3 * 4 * (long)sizeof(float), "torn: the new row starts on a row boundary");
     m = hc_memory_open(dir);
-    CHECK(m && hc_memory_count(m) == 2, "torn: the write after a log fragment survives a reopen");
     CHECK(m && hc_memory_query(m, b, 4, NULL, 0, 1, &hits, &n) == 0 && n == 1
               && strcmp(hits[0].text, "beta") == 0 && hits[0].cosine > 0.999f,
           "torn: the vector written after a partial row reads back intact");
@@ -301,16 +325,50 @@ static void test_torn_tails(void)
     n = 0;
     hc_memory_close(m);
 
-    char id_b[HC_MEM_ID_LEN];
-    m = hc_memory_open(dir);
-    CHECK(m && hc_memory_write(m, &rb, id_b) == 0, "torn: re-upsert to learn beta's id");
-    hc_memory_close(m);
+    /* 2. a record fragment found at open: the next line starts on its own */
     append_raw(dir, "records.jsonl", frag, sizeof frag - 1);
     m = hc_memory_open(dir);
-    CHECK(m && hc_memory_forget(m, id_b) == 0, "torn: forget after a torn log tail");
+    CHECK(m && hc_memory_count(m) == 2, "torn: a torn log tail does not cost the records before it");
+    CHECK(m && hc_memory_write(m, &rc, id_c) == 0, "torn: a write after a log fragment");
     hc_memory_close(m);
     m = hc_memory_open(dir);
-    CHECK(m && hc_memory_count(m) == 1, "torn: a forget written after a log fragment stays forgotten");
+    CHECK(m && hc_memory_count(m) == 3, "torn: the write after a log fragment survives a reopen");
+    hc_memory_close(m);
+
+    /* 3. a tombstone written after a log fragment stays forgotten */
+    append_raw(dir, "records.jsonl", frag, sizeof frag - 1);
+    m = hc_memory_open(dir);
+    CHECK(m && hc_memory_forget(m, id_b) == 0, "torn: forget after a log fragment");
+    hc_memory_close(m);
+    m = hc_memory_open(dir);
+    CHECK(m && hc_memory_count(m) == 2, "torn: a forget written after a log fragment stays forgotten");
+    hc_memory_close(m);
+
+    /* 4. in-session: a failed append can leave bytes behind (planted here while the file is blocked);
+     * the same handle must step past them on its next vector, record and tombstone */
+    m = hc_memory_open(dir);
+    block_file(dir, "vectors.f32", 1);
+    CHECK(m && hc_memory_write(m, &rd, NULL) == -1, "torn: a write whose vector append fails returns -1");
+    block_file(dir, "vectors.f32", 0);
+    append_raw(dir, "vectors.f32", half, sizeof half);
+    CHECK(m && hc_memory_write(m, &rd, NULL) == 0, "torn: the same handle writes after a failed vector append");
+    block_file(dir, "records.jsonl", 1);
+    CHECK(m && hc_memory_write(m, &re, NULL) == -1, "torn: a write whose record append fails returns -1");
+    block_file(dir, "records.jsonl", 0);
+    append_raw(dir, "records.jsonl", frag, sizeof frag - 1);
+    CHECK(m && hc_memory_write(m, &re, NULL) == 0, "torn: the same handle writes after a failed record append");
+    block_file(dir, "records.jsonl", 1);
+    CHECK(m && hc_memory_forget(m, id_c) == -1, "torn: a forget whose append fails returns -1");
+    block_file(dir, "records.jsonl", 0);
+    append_raw(dir, "records.jsonl", frag, sizeof frag - 1);
+    CHECK(m && hc_memory_forget(m, id_c) == 0, "torn: the same handle forgets after a failed append");
+    hc_memory_close(m);
+    m = hc_memory_open(dir);
+    CHECK(m && hc_memory_count(m) == 3, "torn: in-session tails cost nothing on reopen (alpha, delta, epsilon)");
+    CHECK(m && hc_memory_query(m, d, 4, NULL, 0, 1, &hits, &n) == 0 && n == 1
+              && strcmp(hits[0].text, "delta") == 0 && hits[0].cosine > 0.999f,
+          "torn: the vector written after a failed vector append reads back intact");
+    hc_memory_hits_free(hits, n);
     hc_memory_close(m);
 
     char p[1100];

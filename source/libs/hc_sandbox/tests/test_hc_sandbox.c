@@ -219,6 +219,25 @@ int main(void)
         CHECK(hc_sandbox_list(sb, "sub/file.txt", &ents, &ne) != HC_SANDBOX_OK,
               "list of a non-directory errors");
         CHECK(ents == NULL && ne == 0, "failed list yields no entries");
+
+        /* a directory that can be read but not searched: nothing in it can be stat'd, which is an
+         * access error, never an empty directory (root ignores permission bits, so skip there) */
+        if (geteuid() != 0) {
+            char nox[600], nf[700];
+            snprintf(nox, sizeof nox, "%s/sub/nox", root);
+            snprintf(nf, sizeof nf, "%s/f", nox);
+            mkdir(nox, 0700);
+            write_file(nf, "x");
+            chmod(nox, 0600);
+            ents = NULL;
+            ne = 0;
+            CHECK(hc_sandbox_list(sb, "sub/nox", &ents, &ne) == HC_SANDBOX_ERR_ACCESS,
+                  "list of an unsearchable dir is an access error, not empty");
+            hc_sandbox_list_free(ents);
+            chmod(nox, 0700);
+            unlink(nf);
+            rmdir(nox);
+        }
     }
 
     /* --- hc_sandbox_mkdirs (mkdir -p inside the jail; the deliverable-subdir enabler) --- */

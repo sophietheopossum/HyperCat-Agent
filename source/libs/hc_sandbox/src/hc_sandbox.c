@@ -435,7 +435,7 @@ hc_sandbox_status hc_sandbox_list(hc_sandbox *s, const char *user_path, hc_sandb
     hc_sandbox_dirent *arr = NULL;
     size_t             cap = 0, n = 0;
     struct dirent     *de;
-    int                read_errno = 0;
+    int                read_errno = 0, stat_errno = 0;
     while (n < HC_SANDBOX_LIST_MAX) {
         /* Clear errno for readdir alone: at end-of-dir it returns NULL WITHOUT touching errno, so a value
          * left by a skipped fstatat below would otherwise read as a directory error. */
@@ -450,7 +450,10 @@ hc_sandbox_status hc_sandbox_list(hc_sandbox *s, const char *user_path, hc_sandb
          * symlink reports is_dir==0. Skip an entry that vanished/denied between readdir and fstatat
          * (a same-uid race) rather than emitting a misleading 0-byte row. */
         struct stat est;
-        if (fstatat(dirfd(d), de->d_name, &est, AT_SYMLINK_NOFOLLOW) != 0) continue;
+        if (fstatat(dirfd(d), de->d_name, &est, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT && !stat_errno) stat_errno = errno; /* vanished is benign; denied is not */
+            continue;
+        }
         if (n == cap) {
             size_t             ncap = cap ? cap * 2 : 32;
             hc_sandbox_dirent *na = realloc(arr, ncap * sizeof *na);
@@ -468,10 +471,14 @@ hc_sandbox_status hc_sandbox_list(hc_sandbox *s, const char *user_path, hc_sandb
         arr[n].size = S_ISREG(est.st_mode) ? (int64_t)est.st_size : 0;
         n++;
     }
-    closedir(d);            /* closes the owned fd */
+    closedir(d); /* closes the owned fd */
     if (read_errno != 0 && n == 0) {
         free(arr);
         return map_errno(read_errno);
+    }
+    if (stat_errno != 0 && n == 0) { /* e.g. readable but not searchable: never "empty" */
+        free(arr);
+        return map_errno(stat_errno);
     }
     *out = arr;
     *n_out = n;

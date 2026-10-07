@@ -88,7 +88,7 @@ int hc_fs_size(const char *path, size_t *size_out)
         *size_out = 0;
         return 0;
     }
-    if (!S_ISREG(st.st_mode)) return -1;
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) return -1;
     *size_out = (size_t)st.st_size;
     return 0;
 }

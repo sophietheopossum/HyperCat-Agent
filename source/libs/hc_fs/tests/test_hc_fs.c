@@ -47,6 +47,15 @@ int main(void)
     CHECK(r && n == 8 && memcmp(r, "one\ntwo\n", 8) == 0, "append concatenation");
     free(r);
 
+    /* size: a no-follow regular-file size query (absent is 0; a directory or a symlink is -1) */
+    size_t sz = 99;
+    char   absent[1200];
+    CHECK(hc_fs_size(log, &sz) == 0 && sz == 8, "size of the appended log");
+    snprintf(absent, sizeof absent, "%s/absent", sub);
+    sz = 99;
+    CHECK(hc_fs_size(absent, &sz) == 0 && sz == 0, "size of an absent file is 0");
+    CHECK(hc_fs_size(sub, &sz) == -1, "size refuses a directory");
+
     /* list_dirs sees the subdirectory, not the file */
     char **dirs = NULL;
     size_t nd = 0;
@@ -67,6 +76,7 @@ int main(void)
     snprintf(link, sizeof link, "%s/evil_append", sub);
     CHECK(symlink(vfull, link) == 0, "plant evil_append -> victim/stolen");
     CHECK(hc_fs_append(link, "x", 1) != 0, "append refuses a symlinked target (O_NOFOLLOW)");
+    CHECK(hc_fs_size(link, &sz) == -1, "size refuses a symlink (lstat, never followed)");
     CHECK(access(vfull, F_OK) != 0, "the append did NOT land in the victim dir");
     /* atomic_write THROUGH a planted symlink at <path>.tmp is refused */
     snprintf(link, sizeof link, "%s/evil_atomic", sub);

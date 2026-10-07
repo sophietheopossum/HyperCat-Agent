@@ -14,7 +14,8 @@ extern "C" {
  *
  * Purpose:   crash-safe directory + file primitives — mkdir -p (0700), a temp+fsync+rename atomic
  *            write, an O_APPEND+fsync line append, a size-capped whole-file read (bounds host memory
- *            against an oversized/untrusted file), a subdirectory listing, and a UTC timestamp. No
+ *            against an oversized/untrusted file), a no-follow file-size query, a subdirectory listing,
+ *            and a UTC timestamp. No
  *            store/JSON/LLM semantics — just bytes + paths.
  * Owns:      nothing persistent; each call operates on caller-supplied paths. hc_fs_list_dirs returns a
  *            malloc'd array of strdup'd names the caller releases with hc_fs_free_list. hc_fs_read_file
@@ -22,7 +23,8 @@ extern "C" {
  * Threading: stateless + reentrant; concurrent calls on DIFFERENT paths are safe (the OS serializes
  *            same-path access; callers that need atomicity across calls coordinate themselves).
  * Security:  files/dirs are created 0700/0600; hc_fs_read_file rejects a file larger than max_bytes
- *            BEFORE allocating; hc_fs_list_dirs LSTATs each entry and returns only real directories (a
+ *            BEFORE allocating; hc_fs_size LSTATs (a symlink or other non-regular file is -1, never
+ *            followed); hc_fs_list_dirs LSTATs each entry and returns only real directories (a
  *            symlink — even to a dir — is skipped). hc_fs_atomic_write/hc_fs_append open the final path
  *            component O_NOFOLLOW, so a pre-planted symlink there cannot redirect the write outside the
  *            store (a same-uid hardening; a symlinked PARENT dir remains the caller's no-follow-walk job).
@@ -34,7 +36,7 @@ extern "C" {
 int   hc_fs_mkdirs(const char *path);                                      /* mkdir -p, 0700          */
 int   hc_fs_atomic_write(const char *path, const char *data, size_t len);  /* temp + fsync + rename   */
 int   hc_fs_append(const char *path, const char *data, size_t len);        /* O_APPEND + fsync, 0600  */
-int   hc_fs_size(const char *path, size_t *size_out);                      /* lstat; absent -> 0      */
+int   hc_fs_size(const char *path, size_t *size_out);                      /* absent 0, !S_ISREG -1  */
 /* Read `path` whole into a malloc'd, NUL-terminated buffer (*len_out = byte length). NULL on error OR
  * when the file exceeds `max_bytes` (the cap bounds host memory against an oversized/planted file). */
 char *hc_fs_read_file(const char *path, size_t max_bytes, size_t *len_out);

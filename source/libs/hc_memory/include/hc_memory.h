@@ -140,11 +140,11 @@ size_t hc_memory_count(const hc_memory *);
  * is made against a store bound to a different embedding model, is REJECTED. id_out (optional;
  * HC_MEM_ID_LEN incl. NUL) receives the content id. 0 on success, -1 on a bad arg / dim mismatch /
  * non-finite-or-zero vector / a bound exceeded (text/scope too long, the live or log cap reached) / I/O
- * failure. NOTE on the one durability subtlety: if the bytes were written but the in-RAM index update
+ * failure. NOTE on durability: if the bytes were written but the in-RAM index update
  * then OOM'd, this returns -1 yet the record IS persisted — `hc_memory_count()` will lag until the next
  * `hc_memory_open` recovers it. An I/O-failure -1 may also have persisted it (a complete write whose
  * fsync then failed), or left a partial line or row, which the store steps past on the next write and on
- * reopen. The caller may treat either -1 as retriable: a retry dedups to the same id. */
+ * reopen. The caller may treat any -1 as retriable: a retry dedups to the same id. */
 int hc_memory_write(hc_memory *, const hc_mem_record *, char id_out[HC_MEM_ID_LEN]);
 
 /* Top matches to `qvec` (dim must equal the store's), restricted to the given `scopes` (the recall

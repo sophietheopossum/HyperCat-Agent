@@ -3,8 +3,11 @@
  * Storage layout under the store root (host-private 0700):
  *   records.jsonl  — one JSON object per line: {id,scope,text,source,importance,created_ms,row} for a
  *                    write (upsert = a new line, last-wins on rebuild) or {id,deleted} for a forget.
+ *                    Empty and unparseable lines are skipped: a crash or a failed append can leave a
+ *                    torn fragment, which the next line's leading '\n' ends.
  *   vectors.f32    — the embeddings as raw dim x float32 rows; a record's "row" indexes into it. Raw
  *                    host-endian floats (the store is host-local + ephemeral, so no portable encoding).
+ *                    A torn partial row is zero-padded past, so orphan bytes can sit between rows.
  *   meta.json      — {"dim":N,"model":"<id>"}, the store's fixed embedding dimension AND the embedding
  *                    model that produced its vectors, both adopted on the first write. The model is
  *                    recorded because the dimension alone does not identify a vector space: two
@@ -58,7 +61,7 @@ struct hc_memory {
     int        adopted;   /* 1 when model[] was adopted retroactively, NOT recorded at first write   */
     size_t     vec_bytes; /* vectors.f32 size; exact while appends succeed (live + orphaned rows) */
     int        vec_torn;  /* 1 when vec_bytes is unknown: re-learn it before placing the next row */
-    size_t     log_bytes; /* current records.jsonl size, to bound growth without a per-write stat */
+    size_t     log_bytes; /* records.jsonl size at open + this handle's appends; bounds its growth */
     int        log_torn;  /* 1 when records.jsonl may end mid-line: the next line starts with \n  */
     mem_entry *entries;   /* the live index */
     size_t     n, cap;
@@ -260,8 +263,10 @@ static int rebuild(hc_memory *m)
             free(md);
         }
     }
-    /* Until vectors.f32 is read below, its size is unknown; the first write then learns it from disk. */
+    /* Until the files are read below, their tails are unknown: the first write learns vectors.f32's
+     * size from disk, and starts its record with a '\n' (an empty line, which replay skips). */
     m->vec_torn = 1;
+    m->log_torn = 1;
     if (m->dim <= 0) return 0; /* a store with no meta has no records yet */
 
     char vpath[1200], rpath[1200];
@@ -283,13 +288,20 @@ static int rebuild(hc_memory *m)
     int    rc = 0;
     size_t rlen = 0;
     char  *data = hc_fs_read_file(rpath, HC_MEM_LOG_MAX, &rlen);
+    if (!data) { /* absent, or over the read cap: bound the next write by the real size anyway */
+        size_t sz = 0;
+        if (hc_fs_size(rpath, &sz) == 0) m->log_bytes = sz;
+    }
     if (data) {
         m->log_bytes = rlen;
         /* A crash mid-append leaves a fragment with no newline; the next line must not be glued to it. */
         m->log_torn = (rlen > 0 && data[rlen - 1] != '\n') ? 1 : 0;
-        for (char *p = data; *p;) {
-            char  *nl = strchr(p, '\n');
-            size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+        /* by length, not to the first NUL: a torn region can hold zero bytes, and stopping there would
+         * hide every line after it */
+        const char *end = data + rlen;
+        for (char *p = data; p < end;) {
+            char  *nl = memchr(p, '\n', (size_t)(end - p));
+            size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
             if (llen > 0) {
                 hc_json *o = hc_json_parse(p, llen);
                 if (o) {
@@ -420,6 +432,8 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
     const size_t row_bytes = (size_t)r->dim * sizeof(float);
     const size_t pad = (row_bytes - m->vec_bytes % row_bytes) % row_bytes;
     const size_t row = (m->vec_bytes + pad) / row_bytes;
+    /* the read cap: past it the next open could not load vectors.f32 and would come up EMPTY */
+    if (m->vec_bytes + pad + row_bytes > HC_MEM_VEC_MAX) return -1;
 
     /* build the record line first so we can bound the log before touching the vector file */
     hc_json *o = hc_json_new_object();
@@ -435,7 +449,20 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
     if (!line) return -1;
     size_t       llen = strlen(line);
     const size_t lead = m->log_torn ? 1 : 0; /* a '\n' that ends a torn fragment on its own line */
-    if (m->log_bytes + lead + llen + 1 > HC_MEM_LOG_SOFT) { /* soft write cap; headroom left for forgets */
+    /* soft write cap; headroom left for forgets */
+    if (m->log_bytes + lead + llen + 1 > HC_MEM_LOG_SOFT) {
+        free(line);
+        return -1;
+    }
+    /* Allocate before the meta commit below: an OOM after it would brand a store that holds nothing. */
+    char *vbuf = NULL;
+    if (pad != 0 && !(vbuf = calloc(1, pad + row_bytes))) {
+        free(line);
+        return -1;
+    }
+    char *buf = malloc(lead + llen + 1);
+    if (!buf) {
+        free(vbuf);
         free(line);
         return -1;
     }
@@ -452,6 +479,8 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
          * say whether the recorded id was witnessed or inferred. */
         const bool  now_adopted = m->want[0] ? (adopt || rebind) : (m->adopted != 0);
         if (write_meta(m, first ? r->dim : m->dim, bind, now_adopted) != 0) {
+            free(buf);
+            free(vbuf);
             free(line);
             return -1;
         }
@@ -463,29 +492,20 @@ int hc_memory_write(hc_memory *m, const hc_mem_record *r, char id_out[HC_MEM_ID_
      * line referencing it. A failure in either can leave bytes behind; the torn flags make the next write
      * step past them, so they stay harmless orphans and never shift or corrupt a later record. */
     int vrc;
-    if (pad == 0) {
-        vrc = hc_fs_append(vpath, (const char *)r->vec, row_bytes);
-    } else {
-        char *vbuf = calloc(1, pad + row_bytes);
-        if (!vbuf) {
-            free(line);
-            return -1;
-        }
+    if (vbuf) {
         memcpy(vbuf + pad, r->vec, row_bytes);
         vrc = hc_fs_append(vpath, vbuf, pad + row_bytes);
         free(vbuf);
+    } else {
+        vrc = hc_fs_append(vpath, (const char *)r->vec, row_bytes);
     }
     if (vrc != 0) {
         m->vec_torn = 1;
+        free(buf);
         free(line);
         return -1;
     }
     m->vec_bytes += pad + row_bytes;
-    char *buf = malloc(lead + llen + 1);
-    if (!buf) {
-        free(line);
-        return -1;
-    }
     if (lead) buf[0] = '\n';
     memcpy(buf + lead, line, llen);
     buf[lead + llen] = '\n';

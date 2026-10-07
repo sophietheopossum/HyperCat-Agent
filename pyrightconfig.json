@@ -1,0 +1,5 @@
+{
+  "executionEnvironments": [
+    { "root": "source/libs/hc_tool_sdk/examples", "extraPaths": ["source/libs/hc_tool_sdk/python"] }
+  ]
+}

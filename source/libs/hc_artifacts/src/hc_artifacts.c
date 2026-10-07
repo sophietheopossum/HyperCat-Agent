@@ -127,7 +127,7 @@ int hc_artifacts_record(hc_artifacts *a, const char *id, const hc_provenance *p)
     char path[1200];
     int  rc = -1;
     if ((size_t)snprintf(path, sizeof path, "%s/provenance.jsonl", a->root) < sizeof path)
-        rc = hc_fs_append(path, buf, len + 1);
+        rc = hc_fs_append_line(path, buf, len + 1); /* never glued onto a torn tail */
     free(buf);
     free(line);
     return rc;
@@ -166,9 +166,12 @@ static int read_recs(hc_artifacts *a, const char *key, const char *val, size_t m
         return -1;
     }
     size_t head = 0, total = 0;
-    for (char *p = data; *p;) {
-        char  *nl = strchr(p, '\n');
-        size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+    /* by length, not to the first NUL: a torn tail can be zero-filled, and stopping there would hide every
+     * row after it */
+    const char *end = data + flen;
+    for (char *p = data; p < end;) {
+        char  *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
         if (llen > 0) {
             hc_json *o = hc_json_parse(p, llen);
             if (o) {

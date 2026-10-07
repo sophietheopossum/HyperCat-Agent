@@ -127,6 +127,39 @@ int main(void)
         hc_artifacts_close(a);
     }
 
+    /* torn tails: a crash or a failed append can leave provenance.jsonl ending mid-line, or zero-filled. The
+     * next row must start on its own line and still be read, or the deliverable vanishes from the conductor. */
+    a = hc_artifacts_open(root);
+    CHECK(a != NULL, "torn: reopen");
+    if (a) {
+        char ppath[1200];
+        snprintf(ppath, sizeof ppath, "%s/provenance.jsonl", root);
+        FILE *tf = fopen(ppath, "ab");
+        CHECK(tf && fwrite("{\"id\":\"ab", 1, 9, tf) == 9, "torn: plant a cut-off row");
+        if (tf) fclose(tf);
+        hc_provenance pt = {0};
+        pt.agent = "agent:C";
+        pt.task = "t9";
+        pt.tool = "fs_write";
+        pt.label = "torn.txt";
+        pt.size = 1;
+        CHECK(hc_artifacts_record(a, id3, &pt) == 0, "torn: record after a cut-off row");
+        tf = fopen(ppath, "ab");
+        CHECK(tf && fwrite("\0\0\0\0", 1, 4, tf) == 4, "torn: plant a zero-filled tail");
+        if (tf) fclose(tf);
+        pt.task = "t10";
+        CHECK(hc_artifacts_record(a, id3, &pt) == 0, "torn: record after a zero-filled tail");
+        hc_artifacts_close(a);
+        a = hc_artifacts_open(root);
+        CHECK(a && hc_artifacts_by_task(a, "t9", &recs, &nr) == 0 && nr == 1,
+              "torn: the row after a cut-off row survives");
+        hc_artifacts_recs_free(recs, nr);
+        CHECK(a && hc_artifacts_by_task(a, "t10", &recs, &nr) == 0 && nr == 1,
+              "torn: the row after a zero-filled tail is read");
+        hc_artifacts_recs_free(recs, nr);
+        if (a) hc_artifacts_close(a);
+    }
+
     if (g_fails) {
         fprintf(stderr, "hc_artifacts: %d check(s) failed\n", g_fails);
         return 1;

@@ -125,6 +125,31 @@ int main(void)
         hc_store_list_free(pi, pnn);
     }
 
+    /* torn tails: a crash or a failed append can leave transcript.jsonl ending mid-line, or zero-filled. The
+     * next message must start on its own line and still be read: glued on, or hidden behind a NUL, it would
+     * vanish from resume, the session browser and consolidation. */
+    {
+        hc_session *ts = hc_session_new(st, "Torn", "m");
+        CHECK(ts && hc_session_append(ts, "user", "before"), "torn: first message");
+        char tid[80], tpath[1400];
+        snprintf(tid, sizeof tid, "%s", ts ? hc_session_id(ts) : "");
+        snprintf(tpath, sizeof tpath, "%s/transcript.jsonl", ts ? hc_session_dir(ts) : "");
+        FILE *tf = fopen(tpath, "ab");
+        CHECK(tf && fwrite("{\"role\":\"us", 1, 11, tf) == 11, "torn: plant a cut-off line");
+        if (tf) fclose(tf);
+        CHECK(ts && hc_session_append(ts, "assistant", "after a cut-off line"), "torn: append after a cut-off line");
+        tf = fopen(tpath, "ab");
+        CHECK(tf && fwrite("\0\0\0\0", 1, 4, tf) == 4, "torn: plant a zero-filled tail");
+        if (tf) fclose(tf);
+        CHECK(ts && hc_session_append(ts, "user", "after zeros"), "torn: append after a zero-filled tail");
+        hc_session_free(ts);
+        hc_session *tr = hc_session_load(st, tid);
+        CHECK(tr && hc_session_count(tr) == 3, "torn: all three messages reload");
+        CHECK(tr && hc_session_message(tr, 2, &role, &content) && strcmp(content, "after zeros") == 0,
+              "torn: the message after a zero-filled tail is read");
+        hc_session_free(tr);
+    }
+
     hc_store_close(st);
 
     if (g_fails) {

@@ -208,7 +208,7 @@ bool hc_session_append(hc_session *se, const char *role, const char *content)
     line[llen + 1] = '\0';
 
     /* persist (append-only, crash-safe) before mirroring in memory */
-    int rc = hc_fs_append(se->transcript, line, llen + 1);
+    int rc = hc_fs_append_line(se->transcript, line, llen + 1); /* never glued onto a torn tail */
     free(line);
     if (rc != 0) return false;
     if (!msgs_push(se, role, content, ts)) return false;
@@ -258,10 +258,12 @@ hc_session *hc_session_load(hc_store *store, const char *id)
     size_t tlen = 0;
     char *t = hc_fs_read_file(se->transcript, HC_STORE_TRANSCRIPT_MAX, &tlen);
     if (t) {
-        const char *p = t;
-        while (*p) {
-            const char *nl = strchr(p, '\n');
-            size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        /* by length, not to the first NUL: a torn tail can be zero-filled, and stopping there would hide
+         * every message after it */
+        const char *p = t, *end = t + tlen;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            size_t linelen = nl ? (size_t)(nl - p) : (size_t)(end - p);
             if (linelen > 0) {
                 hc_json *o = hc_json_parse(p, linelen);
                 if (o) {

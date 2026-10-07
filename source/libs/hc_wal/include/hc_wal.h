@@ -18,11 +18,12 @@ extern "C" {
  *            <dir>/<stream_id>.wal.
  * Owns:      hc_wal_open returns a small handle holding the validated path; hc_wal_close frees it. replay /
  *            list / remove are stateless (path-based). No fd is held across calls (append reopens via
- *            hc_fs_append — one writer, infrequent records, so the reopen cost is irrelevant and there is
- *            no fd lifetime to leak).
+ *            hc_fs_append_line — one writer, infrequent records, so the reopen cost is irrelevant and
+ *            there is no fd lifetime to leak).
  * Threading: a stream is SINGLE-WRITER by contract (the orchestrator's driver thread is the sole appender).
  *            hc_wal adds no lock; concurrent appenders to one stream would interleave at OS O_APPEND
- *            granularity — callers own ordering. Different streams are independent.
+ *            granularity (and race append's torn-tail check + partial-write rollback) — callers own
+ *            ordering. Different streams are independent.
  * Security:  stream_id becomes a path component — it is traversal-validated (reject '/' / ".." / empty /
  *            over-long / control bytes), exactly like hc_store's id guard, so a stream id read from a
  *            (same-uid-writable) listing can never escape `dir`. Every read is byte-capped
@@ -42,19 +43,23 @@ typedef struct hc_wal hc_wal;
  * NULL if stream_id is unsafe (traversal / empty / over-long / control bytes) or on allocation failure. */
 hc_wal *hc_wal_open(const char *dir, const char *stream_id);
 
-/* Append one record: `line` (len bytes) followed by a '\n', crash-safe (O_APPEND + fsync). Returns -1
+/* Append one record: `line` (len bytes) followed by a '\n', crash-safe (O_APPEND + fsync), started on a
+ * fresh line after a torn tail (never glued onto it) and rolled back if the write fails partway. Returns -1
  * (writing nothing) if `line` is NULL, exceeds HC_WAL_MAX_LINE, or contains a '\n'. 0 on a durable append. */
 int hc_wal_append(hc_wal *w, const char *line, size_t len);
 
 void hc_wal_close(hc_wal *w);
 
-/* Replay callback: one COMPLETE record `line` (NUL-terminated, `len` bytes, no trailing newline). Return 0
- * to continue, non-zero to stop the replay early. */
+/* Replay callback: one line of the stream (NUL-terminated, `len` bytes, no trailing newline) — a complete
+ * record, or a fragment a later append closed off (see hc_wal_replay). Return 0 to continue, non-zero to
+ * stop the replay early. */
 typedef int (*hc_wal_line_cb)(const char *line, size_t len, void *user);
 
 /* Replay `stream_id`'s records in append order, SKIPPING a torn tail (trailing bytes with no terminating
- * newline = a partial record from a crash mid-append). An absent stream is 0 records (returns 0). Returns
- * -1 on a hard read error or an over-cap file. */
+ * newline = a partial record from a crash mid-append). Once a later append has ended it, that fragment is
+ * a line of its own and reaches `cb` like any record — `cb` must skip one it cannot parse (and a fragment
+ * cut just before its newline is a whole record that parses: treat it as possibly unacknowledged). An absent
+ * stream is 0 records (returns 0). Returns -1 on a hard read error or an over-cap file. */
 int hc_wal_replay(const char *dir, const char *stream_id, hc_wal_line_cb cb, void *user);
 
 /* Stream-scan callback: a `stream_id` that has a WAL under `dir`. Return 0 to continue, non-zero to stop. */

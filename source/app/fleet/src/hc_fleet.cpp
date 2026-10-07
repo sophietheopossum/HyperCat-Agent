@@ -137,7 +137,7 @@ static std::string effective_role_tools_csv(const RoleDef &rd, const Settings &s
 
 std::vector<std::string> role_spawn_args(const RoleTable &roles, const Settings &settings,
                                          const std::string &role, bool live, const char *global_model,
-                                         const char *global_provider)
+                                         const char *global_provider, const char *base_url)
 {
     std::vector<std::string> extra;
     if (live) {
@@ -153,6 +153,13 @@ std::vector<std::string> role_spawn_args(const RoleTable &roles, const Settings 
         if (!provider.empty()) {
             extra.push_back("--provider");
             extra.push_back(std::move(provider));
+        }
+        /* The endpoint rides argv for the same reason. Unforwarded, a worker fell back to OpenRouter while
+         * the conductor and planner called HC_BASE_URL, so the key meant for that endpoint went to
+         * openrouter.ai. */
+        if (base_url && *base_url) {
+            extra.push_back("--base-url");
+            extra.push_back(base_url);
         }
     }
     if (!role.empty()) {
@@ -264,8 +271,12 @@ bool Fleet::add_worker(const WorkerDef &def)
         {
             std::unique_lock<std::mutex> rlk;
             if (p_->roles_mu) rlk = std::unique_lock<std::mutex>(*p_->roles_mu);
+            /* HC_BASE_URL is read here, for each new worker, as its key is (the child inherits environ), not
+             * once at create: a key changed mid-session would otherwise go to the endpoint the session started
+             * on. The conductor does the same: install_conductor re-reads it on every New Chat. (A supervisor
+             * autorestart reuses these args with a fresh environ; the app never enables autorestart.) */
             extra = role_spawn_args(*p_->roles, *p_->settings, def.role, p_->env.live, p_->env.model,
-                                    getenv("HC_OPENROUTER_PROVIDER"));
+                                    getenv("HC_OPENROUTER_PROVIDER"), getenv("HC_BASE_URL"));
         }
         args = agent_args(def.id, p_->env.live, p_->env.shared_workspace, p_->env.ws_root, p_->env.sessions_root,
                           p_->env.skills_dir, p_->env.skills_catalog, p_->llm_args, std::move(extra));

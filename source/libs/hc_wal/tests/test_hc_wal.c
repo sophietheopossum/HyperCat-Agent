@@ -1,8 +1,9 @@
 /* test_hc_wal — the P14 WAL primitive gate (offline, deterministic). Proves: an append/replay round-trip;
  * an IDEMPOTENT double-replay (replaying twice yields the same records — recovery can re-run safely); a
- * TORN-TAIL skip (a crash mid-append leaves a newline-less fragment that replay ignores); a traversal-
- * unsafe stream id is REJECTED; a newline inside a record is rejected (it would split the record); list
- * reports the *.wal streams; remove is idempotent. No domain logic — just bytes + paths. */
+ * TORN-TAIL skip (a crash mid-append leaves a newline-less fragment that replay ignores, and the next
+ * append is not glued onto it); a traversal-unsafe stream id is REJECTED; a newline inside a record is
+ * rejected (it would split the record); list reports the *.wal streams; remove is idempotent. No domain
+ * logic — just bytes + paths. */
 
 #include "hc_wal.h"
 
@@ -95,6 +96,19 @@ int main(void)
         hc_wal_replay(dir, "torn", collect, &s);
         CHECK(s.n == 1, "torn tail (newline-less fragment) is skipped — only the complete record replays");
         CHECK(s.n >= 1 && strcmp(s.lines[0], "{\"t\":\"open\"}") == 0, "the surviving record is the complete one");
+
+        /* the next append (a resume reuses the stream) must start on a fresh line: glued onto the fragment
+         * it would replay as one unparseable line, and the caller's fold would drop the record with it */
+        w = hc_wal_open(dir, "torn");
+        CHECK(w && APP(w, "{\"t\":\"settled\"}") == 0, "append after a torn tail");
+        hc_wal_close(w);
+        struct sink s2 = {0};
+        hc_wal_replay(dir, "torn", collect, &s2);
+        CHECK(s2.n == 3, "the fragment and the next record replay as two separate lines");
+        CHECK(s2.n == 3 && strcmp(s2.lines[1], "{\"t\":\"done\",\"id\":\"part") == 0,
+              "the fragment is left alone on its own line");
+        CHECK(s2.n == 3 && strcmp(s2.lines[2], "{\"t\":\"settled\"}") == 0,
+              "a record appended after a torn tail replays intact");
     }
 
     /* --- a record containing a newline is REJECTED (it would split into two records on replay) --- */

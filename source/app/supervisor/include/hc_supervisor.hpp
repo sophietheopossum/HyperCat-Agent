@@ -26,9 +26,9 @@
  *            revoke_id() SYNCHRONOUSLY, and revoke_id also cuts any still-live connection, so the freed id
  *            can no longer route the moment reap() returns — the remove-path squat closure, symmetric with
  *            the spawn-path authorize. create() refuses a socket dir
- *            that is not 0700 and owned by us. Other residual same-uid items (broker per-frame
- *            slow-loris deadline; a pid-reuse window in signal(); waitpid(-1) specificity once the
- *            host has non-worker children) are logged, not yet closed.
+ *            that is not 0700 and owned by us. Another residual same-uid item (the broker's per-frame
+ *            slow-loris deadline) is logged, not yet closed. The monitor reaps ONLY its own pids (waitpid(pid, WNOHANG)), so
+ *            the host's other children (tools, helpers, exec runs, the pty) keep their exit status.
  */
 
 #include <string>

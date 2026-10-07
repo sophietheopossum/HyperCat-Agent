@@ -1,11 +1,13 @@
 /* hc_supervisor — see hc_supervisor.hpp. Spawns + monitors + authenticates agentd workers.
  *
  * Two internal threads, each blocking on a different source:
- *   - monitor : waitpid(-1) — reaps worker exits; respawns when autorestart is on and not stopping.
+ *   - monitor : waitpid(pid, WNOHANG) per worker, every kSweepPollMs — reaps ONLY our workers' exits
+ *               (never waitpid(-1): the host has other children); respawns when autorestart is on and
+ *               not stopping.
  *   - check-in: host BusClient recv — answers worker check-ins, verifying the one-time spawn token
  *               against the registry (so a bus id is bound to the process we actually launched).
  * The registry (id -> {pid, token, ready, alive}) is guarded by one mutex; a condition variable
- * lets the monitor sleep when there are no children instead of spinning on ECHILD. Spawns are
+ * lets the monitor sleep when there are no workers, and between its reap sweeps. Spawns are
  * serialized by holding that mutex across spawn_worker (its inheritable token-pipe fd requires it).
  */
 
@@ -16,6 +18,7 @@
 #include "hc_bus.hpp"
 #include "hc_json.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +114,7 @@ constexpr int kMaxRestarts = 5; /* circuit breaker: stop auto-respawning an id t
                                  * cleanly (e.g. its name is squatted) instead of a hot fork loop */
 constexpr int kReapPollIter = 50; /* reap()'s SIGTERM->reaped poll budget: 50 x 10ms = ~500ms before escalating */
 constexpr int kReapPollMs   = 10; /* the poll interval */
+constexpr int kSweepPollMs  = 20; /* monitor_loop's reap sweep period: the bound on crash-detect latency */
 
 /* The bus socket must live in a host-private directory (mode 0700, owned by us) so a same-uid peer
  * cannot pre-bind or relink the path — the peer-cred uid gate only stops OTHER uids. Verify the
@@ -137,7 +141,7 @@ struct Supervisor::Impl {
     Broker     *broker = nullptr; /* borrowed; binds id<->pid at spawn/reap (may be null in tests) */
 
     std::mutex                                mu;
-    std::condition_variable                   cv; /* monitor sleeps here when alive_count == 0 */
+    std::condition_variable                   cv; /* monitor sleeps here: idle, and between reap sweeps */
     std::unordered_map<std::string, Worker>   workers;    /* by id  */
     std::unordered_map<long, std::string>     pid_to_id;  /* reverse */
     int                                       alive_count = 0;
@@ -177,33 +181,33 @@ bool Supervisor::Impl::spawn_locked(const std::string &id, const std::vector<std
 
 void Supervisor::Impl::monitor_loop()
 {
+    std::unique_lock<std::mutex> lk(mu);
     for (;;) {
-        {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return alive_count > 0 || stopping; });
-            if (stopping && alive_count == 0) return;
+        cv.wait(lk, [&] { return alive_count > 0 || stopping; });
+        if (stopping && alive_count == 0) return;
+        /* Reap ONLY our own workers, each by pid with WNOHANG — never waitpid(-1). The host has other
+         * children (ToolHost tools, the audio helper, hc_exec runs, the operator pty) that their owners
+         * waitpid() by pid; reaping one here would lose its exit status and fail the owner's wait with
+         * ECHILD. The reap and the registry update share this one mu hold, so signal() never sees a
+         * reaped pid as alive. No exit this sweep => sleep kSweepPollMs (a spawn/shutdown notify cuts
+         * it short). */
+        auto it = pid_to_id.begin();
+        for (; it != pid_to_id.end(); ++it) {
+            pid_t r = waitpid((pid_t)it->first, nullptr, WNOHANG);
+            if (r > 0 || (r < 0 && errno == ECHILD)) break; /* reaped, or no longer ours to wait on: gone */
         }
-        int status = 0;
-        /* waitpid(-1) reaps ANY child — correct only while the supervisor is the host's sole
-         * child-spawner (true in v1; no exec tool yet). Revisit with per-pid waitpid / signalfd
-         * when another subsystem forks (the step-5 exec tool) — see EXPANSIONS. We hold no lock
-         * while blocking here. */
-        pid_t pid = waitpid(-1, &status, 0);
-        if (pid < 0) {
-            if (errno == EINTR || errno == ECHILD) continue; /* cv gate re-blocks us if idle */
-            return;
+        if (it == pid_to_id.end()) {
+            cv.wait_for(lk, std::chrono::milliseconds(kSweepPollMs));
+            continue;
         }
         std::string id;
         long        new_pid = -1;
-        bool        respawned = false;
+        bool        respawned = false, is_retiring = false;
         {
-            std::lock_guard<std::mutex> lk(mu);
-            auto it = pid_to_id.find((long)pid);
-            if (it == pid_to_id.end()) continue; /* not one of ours */
             id = it->second;
             pid_to_id.erase(it);
             auto w = workers.find(id);
-            bool is_retiring = (w != workers.end()) && w->second.retiring;
+            is_retiring = (w != workers.end()) && w->second.retiring;
             if (w != workers.end()) {
                 w->second.alive = false;
                 w->second.ready = false;
@@ -235,10 +239,14 @@ void Supervisor::Impl::monitor_loop()
         /* Update the broker's id<->pid binding OUTSIDE the registry lock (unnested lock order). A
          * respawn re-binds to the new pid (overwriting the dead one, evicting any stale squatter); a
          * give-up clears the binding so the id falls back to the dup-refusal floor. */
-        if (broker) {
+        lk.unlock();
+        /* A retired id is revoked by reap() itself, synchronously, before it returns. Revoking it here too could
+         * land after the caller has re-added the same id, and de-authorize the NEW worker. */
+        if (broker && !is_retiring) {
             if (respawned) broker->authorize_id(id, new_pid);
             else           broker->revoke_id(id);
         }
+        lk.lock();
     }
 }
 
@@ -336,15 +344,14 @@ bool Supervisor::signal(const std::string &id, int sig)
     std::lock_guard<std::mutex> lk(p_->mu);
     auto it = p_->workers.find(id);
     if (it == p_->workers.end() || !it->second.alive) return false;
-    /* Narrow residual: if the monitor reaped this pid between its waitpid() and the alive=false
-     * update, the pid may be recycled and this kill could hit an unrelated same-uid process. Low
-     * risk in v1 (same-uid model; the OS keeps the pid as a zombie until the monitor reaps, and we
-     * only signal during the test/shutdown). A pidfd path closes it — deferred (EXPANSIONS). */
+    /* No pid-reuse window while the monitor is the only waiter on worker pids: it reaps under mu, in the
+     * same hold that clears `alive`, so an alive pid seen here is still our child (running, or a zombie
+     * the OS keeps until that reap). */
     return kill((pid_t)it->second.pid, sig) == 0;
 }
 
 /* Poll (under mu) until `id` has left the registry (the monitor's retiring-erase) or the budget elapses;
- * true iff gone. reap() can't waitpid itself (the monitor owns waitpid(-1)), so it polls for the erase. */
+ * true iff gone. reap() can't waitpid itself (the monitor owns waitpid), so it polls for the erase. */
 bool Supervisor::Impl::wait_gone(const std::string &id, int iters)
 {
     for (int i = 0; i < iters; i++) {
@@ -363,29 +370,28 @@ bool Supervisor::reap(const std::string &id)
         auto it = p_->workers.find(id);
         if (it == p_->workers.end()) return false; /* unknown id */
         if (it->second.alive) {
-            it->second.retiring = true; /* the monitor will NOT respawn it; it revokes + erases on reap */
+            it->second.retiring = true; /* the monitor will NOT respawn it; it erases on reap (we revoke) */
             pid = it->second.pid;
+            /* Signal under mu: the monitor reaps in the same hold that clears `alive`, so this pid is still
+             * our child (running, or a zombie) and cannot have been recycled. */
+            if (kill((pid_t)pid, SIGTERM) < 0)
+                std::fprintf(stderr, "supervisor: reap SIGTERM '%s' failed (errno %d)\n", id.c_str(), errno);
         } else {
             p_->workers.erase(it); /* already dead-but-known (crashed, autorestart off): erase here */
         }
     }
     if (pid > 0) {
-        /* ESRCH = the monitor already reaped it between our unlock and this kill — fine, wait_gone confirms. */
-        if (kill((pid_t)pid, SIGTERM) < 0 && errno != ESRCH)
-            std::fprintf(stderr, "supervisor: reap SIGTERM '%s' failed (errno %d)\n", id.c_str(), errno);
         if (!p_->wait_gone(id, kReapPollIter)) { /* SIGTERM ignored / wedged -> hard-kill, then wait again */
-            long kpid = -1;
             {
-                std::lock_guard<std::mutex> lk(p_->mu);
+                std::lock_guard<std::mutex> lk(p_->mu); /* under mu, for the same reason as the SIGTERM */
                 auto it = p_->workers.find(id);
-                if (it != p_->workers.end() && it->second.alive) kpid = it->second.pid;
+                if (it != p_->workers.end() && it->second.alive) kill((pid_t)it->second.pid, SIGKILL);
             }
-            if (kpid > 0) kill((pid_t)kpid, SIGKILL);
             p_->wait_gone(id, kReapPollIter);
         }
     }
-    /* De-authorize the id's bus routing on EVERY path. The monitor also revokes on reap, but doing it here
-     * makes it synchronous + idempotent AND (via revoke_id) cuts a still-live wedged connection — so when
+    /* De-authorize the id's bus routing on EVERY path, here and only here (the monitor skips a retired id),
+     * so it is synchronous + idempotent AND (via revoke_id) cuts a still-live wedged connection — so when
      * reap() returns the freed id can no longer route, closing the same-uid squat on a removed worker (the
      * token-gated routing authority withdrawn). */
     if (p_->broker) p_->broker->revoke_id(id);

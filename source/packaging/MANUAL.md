@@ -241,7 +241,7 @@ A note on overrides: if you set a value through an environment variable, that va
 - **API key.** Shows whether a key is set and where. Type a key into the masked field and click "Set key" to store it; if a keyring is available it is saved there and persists across restarts. "Forget stored key" clears it. The "export key to worker env" toggle is a security choice and is off by default; see the note under [Your API key and provider](#your-api-key-and-provider).
 - **Limits.** Time and depth budgets for the agents (the per-call and connect timeouts, the reasoning depth, and the per-task deadline). These apply on the next restart.
 - **Paths.** Where data is stored, and an "ephemeral" switch for throwaway runs. Applies on the next restart.
-- **Egress allowlist (advanced).** HyperCat refuses outbound connections by default except to your provider. This list re-permits specific numeric IP addresses. Adding an address is confirm-gated and warns about risky targets; removing one is immediate.
+- **Egress allowlist (advanced).** Worker agents refuse connections to non-public addresses (your local network, this machine) by default. This list re-permits specific numeric IP addresses. Adding an address is confirm-gated and warns about risky targets; removing one is immediate.
 - **Run allowlist (advanced).** The exact programs an agent's run tool is permitted to execute, by absolute path. Default-deny; every run is also sandboxed.
 - **Automation.** Two opt-in ways to relax the approval gate, both off by default. "Auto-approve contained writes" approves only file writes that stay inside the project workspace, and still prompts for anything else. "Allow all" is a power-user switch that approves every request; it is armed through a confirmation dialog where you type a phrase, shows a standing warning while active, and is disarmed in one click. Use it with care.
 - **Audio.** Volume, whether the spectrum display is shown, and whether the conductor may set the mood.
@@ -273,7 +273,7 @@ export HC_MODEL="anthropic/claude-opus-4.1"             # required for live mode
 export HC_BASE_URL="https://openrouter.ai/api/v1"       # optional; this is the default
 ```
 
-`HC_MODEL` is required for the agents to do anything; without it they stay offline even with a valid key. The default provider is OpenRouter. To use a different OpenAI-compatible endpoint, point `HC_BASE_URL` at it. You can also set the model and base URL in Settings > Provider.
+`HC_MODEL` is required for the agents to do anything; without it they stay offline even with a valid key. The default provider is OpenRouter. To use a different OpenAI-compatible endpoint, point `HC_BASE_URL` at it. You can also set the model and base URL in Settings > Provider. The conductor and every worker agent call that endpoint. If it is on your local network or on this machine, also add its numeric IP address to the egress allowlist, then restart HyperCat: worker agents refuse non-public addresses until you do, and the Network (egress) panel (View > Panels) shows the address they were refused.
 
 ### A word on workers and the key
 

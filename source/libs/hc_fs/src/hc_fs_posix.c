@@ -92,10 +92,11 @@ int hc_fs_append_line(const char *path, const char *line, size_t len)
     struct stat st;
     char        last = '\n';
     int         rc = (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) ? 0 : -1;
+    off_t       size = rc == 0 ? st.st_size : -1; /* -1: st unset (fstat failed) or not a file */
     if (rc == 0 && st.st_size > 0 && pread(fd, &last, 1, st.st_size - 1) != 1) rc = -1;
     if (rc == 0 && last != '\n') rc = write_all(fd, "\n", 1);
     if (rc == 0) rc = write_all(fd, line, len);
-    if (rc != 0 && st.st_size >= 0 && ftruncate(fd, st.st_size) != 0) {
+    if (rc != 0 && size >= 0 && ftruncate(fd, size) != 0) {
         /* best effort: a chattr +a log refuses it, and the next call then ends the partial record */
     }
     if (rc == 0 && fsync(fd) != 0) rc = -1;

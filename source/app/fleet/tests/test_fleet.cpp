@@ -76,6 +76,21 @@ int main()
     auto planner_off = role_spawn_args(rt, st, "planner", false, "global", "{\"sort\":\"price\"}");
     CHECK(!has_flag(planner_off, "--provider"), "offline mode carries no routing (nor a model)");
 
+    /* the host's endpoint (HC_BASE_URL) rides along when live, so a worker calls what the conductor and the
+     * planner call. Unforwarded, every worker fell back to OpenRouter and sent the key meant for it there. */
+    const char *lan = "http://192.168.1.50:8080/v1"; /* a LAN endpoint, as test_settings round-trips */
+    auto        dev_url = role_spawn_args(rt, st, "dev", true, "global", nullptr, lan);
+    CHECK(has_pair(dev_url, "--base-url", lan), "a live worker carries the host's base url");
+    auto planner_url = role_spawn_args(rt, st, "planner", true, "global", nullptr, lan);
+    CHECK(has_pair(planner_url, "--base-url", lan) && has_flag(planner_url, "--provider"),
+          "the endpoint is global and independent of routing: a routed role carries both");
+    CHECK(!has_flag(role_spawn_args(rt, st, "dev", true, "global", nullptr, ""), "--base-url"),
+          "an empty base url emits nothing (the worker keeps its OpenRouter default)");
+    CHECK(!has_flag(role_spawn_args(rt, st, "dev", true, "global"), "--base-url"),
+          "no base url passed -> no --base-url");
+    CHECK(!has_flag(role_spawn_args(rt, st, "dev", false, "global", nullptr, lan), "--base-url"),
+          "offline mode carries no base url");
+
     /* role_spawn_args: live dev -> --model + --role + --role-prompt + --role-tools (a subset) */
     auto dev_live = role_spawn_args(rt, st, "dev", true, "global");
     CHECK(has_pair(dev_live, "--model", "operator-dev-model"), "dev (live) carries its resolved model");

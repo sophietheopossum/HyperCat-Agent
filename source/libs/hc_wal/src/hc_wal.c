@@ -1,8 +1,9 @@
 /* hc_wal — per-stream append-only write-ahead log. See hc_wal.h.
  *
  * The whole module is path + bytes: a stream is one <dir>/<id>.wal file; append writes one validated line
- * + '\n' via the shared crash-safe hc_fs_append; replay reads the capped file and splits on '\n', skipping
- * a torn tail; list scans the dir for *.wal; remove unlinks. No JSON, no domain knowledge, no held fd. */
+ * + '\n' via the shared crash-safe hc_fs_append_line (never glued onto a torn tail); replay reads the
+ * capped file and splits on '\n', skipping a torn tail; list scans the dir for *.wal; remove unlinks. No
+ * JSON, no domain knowledge, no held fd. */
 
 #include "hc_wal.h"
 
@@ -63,7 +64,7 @@ int hc_wal_append(hc_wal *w, const char *line, size_t len)
     if (!buf) return -1;
     memcpy(buf, line, len);
     buf[len] = '\n';
-    int r = hc_fs_append(w->path, buf, len + 1);
+    int r = hc_fs_append_line(w->path, buf, len + 1); /* never glued onto a torn tail */
     free(buf);
     return r;
 }

@@ -93,12 +93,18 @@ std::string provider_override(const Settings &, const std::string &role);
 std::string resolve_role_provider(const Settings &, const std::string &role, const char *global_provider);
 
 /* The per-worker `extra` spawn args carrying spawn-time identity: --model (live, resolved) + --provider
- * (live, resolved routing block) + --role + --role-prompt (the overlay APPENDED after the base) +
- * --role-tools (the tool-id subset). An empty overlay/csv is OMITTED, so an unconfigured role spawns
- * exactly as the base (base prompt, all tools, free routing). */
+ * (live, resolved routing block) + --base-url (live, the endpoint) + --role + --role-prompt (the overlay
+ * APPENDED after the base) + --role-tools (the tool-id subset). An empty overlay/csv is OMITTED, so an
+ * unconfigured role spawns exactly as the base (base prompt, all tools, free routing).
+ *
+ * `base_url` is the caller's HC_BASE_URL, the endpoint the conductor and planner call. It is GLOBAL, not
+ * per-role: role_providers routes within that one endpoint and never names another. "" emits nothing, and
+ * the worker keeps its own OpenRouter default, the same default open_chat_llm applies. It rides argv, which
+ * other local users can read (/proc/<pid>/cmdline), so it must not carry credentials; the key stays in env. */
 std::vector<std::string> role_spawn_args(const RoleTable &, const Settings &, const std::string &role,
                                          bool live, const char *global_model,
-                                         const char *global_provider = nullptr);
+                                         const char *global_provider = nullptr,
+                                         const char *base_url = nullptr);
 
 class Fleet {
 public:

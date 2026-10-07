@@ -2,7 +2,9 @@
  * exchange messages over the bus; killing one mid-flight must NOT take down the broker or the
  * other worker (crash-isolation), and the supervisor must reap and (when enabled) respawn it. Phase C
  * proves the DELIBERATE reap() retires a worker WITHOUT respawn (even with autorestart on), frees the id,
- * and the freed id re-authorizes + routes again on a fresh spawn (the bus-id revoke is reversible).
+ * and the freed id re-authorizes + routes again on a fresh spawn (the bus-id revoke is reversible). Phase D
+ * proves the monitor reaps ONLY its workers: a non-worker child of this process keeps its exit status for
+ * its own waitpid(pid), and a foreign zombie still pending does not hide a worker crash from the monitor.
  * Fully offline: no LLM, no network — the workers run the bus harness (ping / pingpeer / shutdown).
  *
  * AGENTD_PATH is injected by CMake ($<TARGET_FILE:agentd>). Exit non-zero on any failure. */
@@ -17,6 +19,7 @@
 #include <ctime>
 #include <string>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 using hc::Broker;
@@ -37,6 +40,15 @@ static void sleep_ms(int ms)
 {
     struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
     nanosleep(&ts, nullptr);
+}
+
+/* The live pid of `id`, or -1. A respawn shows up as a NEW pid: is_ready() alone stays true for the dead
+ * worker until the monitor's next reap sweep notices the exit. */
+static long pid_of(Supervisor *sup, const char *id)
+{
+    for (const auto &w : sup->get_worker_pids())
+        if (w.first == id) return w.second;
+    return -1;
 }
 
 /* Poll pred() until true or the budget elapses; returns pred's final value. */
@@ -113,8 +125,9 @@ int main()
 
     /* ---- Phase B: respawn + recovery ---- */
     sup->set_autorestart(true);
+    long a_was = pid_of(sup, "agent:A");
     CHECK(sup->signal("agent:A", SIGKILL), "kill A");
-    CHECK(wait_until([&] { return sup->is_ready("agent:A"); }, 6000),
+    CHECK(wait_until([&] { return pid_of(sup, "agent:A") != a_was && sup->is_ready("agent:A"); }, 6000),
           "supervisor auto-respawns A and it re-checks in");
     CHECK(sup->spawn("agent:B"), "respawn B");
     CHECK(wait_until([&] { return sup->is_ready("agent:B"); }, 6000), "B back and ready");
@@ -136,6 +149,21 @@ int main()
           "the re-spawned B checks in (the freed id is re-authorized + token-confirmed)");
     CHECK(t && send_cmd(*t, "agent:A", 5, "{\"cmd\":\"pingpeer\",\"peer\":\"agent:B\"}"),
           "A reaches the re-spawned B — the freed id routes again after reap->revoke->respawn->re-authorize");
+
+    /* ---- Phase D: the monitor reaps ONLY its workers — a non-worker child keeps its exit status ---- */
+    /* The host has other children (ToolHost tools, the audio helper, hc_exec runs, the pty), each reaped by its
+     * owner's waitpid(pid). A and B are alive, so a waitpid(-1) monitor would steal this child's exit. */
+    pid_t other = fork();
+    if (other == 0) _exit(42); /* the non-worker child: exit at once with a distinctive status */
+    CHECK(other > 0, "fork a non-worker child");
+    sleep_ms(300); /* ample time for a waitpid(-1) monitor to have reaped (and dropped) it */
+    long a_pid = pid_of(sup, "agent:A");
+    CHECK(a_pid > 0 && sup->signal("agent:A", SIGKILL), "kill A while the foreign zombie is still pending");
+    CHECK(wait_until([&] { return pid_of(sup, "agent:A") != a_pid && sup->is_ready("agent:A"); }, 6000),
+          "the monitor reaps + respawns A past the foreign zombie");
+    int st = 0;
+    CHECK(other > 0 && waitpid(other, &st, 0) == other && WIFEXITED(st) && WEXITSTATUS(st) == 42,
+          "the non-worker child's exit status survives for its own waitpid(pid) (not ECHILD)");
 
     /* ---- teardown ---- */
     delete t;

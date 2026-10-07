@@ -5,9 +5,11 @@
 
 #include "hc_fs.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static int g_fails = 0;
@@ -68,6 +70,24 @@ int main(void)
     CHECK(r && n == 9 && memcmp(r, "a\nfr\nb\nc\n", 9) == 0,
           "append_line ends a torn tail and adds nothing otherwise");
     free(r);
+
+    /* append_line rolls back a write that fails partway, here with a torn tail so the leading '\n' lands
+     * first: a file-size limit just past the current size makes the record's write stop short (EFBIG). */
+    CHECK(hc_fs_append(llog, "zz", 2) == 0, "plant another torn tail");
+    struct rlimit lim_was, lim;
+    size_t        before = 0;
+    signal(SIGXFSZ, SIG_IGN);
+    if (hc_fs_size(llog, &before) == 0 && getrlimit(RLIMIT_FSIZE, &lim_was) == 0) {
+        lim = lim_was;
+        lim.rlim_cur = (rlim_t)before + 3;
+        if (setrlimit(RLIMIT_FSIZE, &lim) == 0) {
+            CHECK(hc_fs_append_line(llog, "0123456789\n", 11) != 0, "append_line fails when its write stops short");
+            setrlimit(RLIMIT_FSIZE, &lim_was);
+            sz = 0;
+            CHECK(hc_fs_size(llog, &sz) == 0 && sz == before, "the partial write (lead '\\n' included) is rolled back");
+        }
+    }
+    signal(SIGXFSZ, SIG_DFL);
 
     /* list_dirs sees the subdirectory, not the file */
     char **dirs = NULL;

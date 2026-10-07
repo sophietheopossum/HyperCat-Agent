@@ -167,6 +167,20 @@ int main(void)
     CHECK(p && hc_projects_get(p, "delta", &got) == 0 && strcmp(got.display, "Delta Renamed") == 0,
           "a rename written after a torn tail survives a reopen");
 
+    /* a COMPLETE record torn only before its '\n' (a crash between the record and its newline) is applied:
+     * the next append ends it instead of gluing onto it, and both records replay */
+    const char whole[] = "{\"created\":8000,\"deleted\":false,\"display\":\"Eps\",\"id\":\"eps\",\"touched\":8000}";
+    tf = fopen(idx, "ab");
+    CHECK(tf && fwrite(whole, 1, sizeof whole - 1, tf) == sizeof whole - 1, "plant a complete record with no newline");
+    if (tf) fclose(tf);
+    CHECK(p && hc_projects_rename(p, "delta", "Delta Again") == 0, "rename delta after a newline-less record");
+    hc_projects_close(p);
+    p = hc_projects_open(dir);
+    CHECK(p && hc_projects_get(p, "eps", &got) == 0 && strcmp(got.display, "Eps") == 0,
+          "the newline-less complete record is applied");
+    CHECK(p && hc_projects_get(p, "delta", &got) == 0 && strcmp(got.display, "Delta Again") == 0,
+          "and the record after it is too");
+
     if (p) hc_projects_close(p);
 
     if (g_fail) {

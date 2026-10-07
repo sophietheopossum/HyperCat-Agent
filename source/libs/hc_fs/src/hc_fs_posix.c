@@ -83,26 +83,21 @@ int hc_fs_append_line(const char *path, const char *line, size_t len)
     /* As hc_fs_append, for a newline-delimited log. A crash or a failed append can leave a fragment with no
      * '\n' at the tail, and appending straight after it would glue this record onto it: a replay that skips
      * the unparseable result loses the record. So when the last byte is not '\n' the record is written with
-     * a leading '\n', leaving the fragment alone on its own line. For a single-writer log: the check and the
-     * append are two steps. O_RDWR (not O_WRONLY) only so the last byte can be read. */
-    if (len >= SIZE_MAX) return -1;
+     * a leading '\n', leaving the fragment alone on its own line. A write that fails partway is rolled back,
+     * so a record the caller was told failed cannot later be completed by the next call's '\n' and replayed.
+     * For a single-writer log: the check and the append are two steps. O_RDWR (not O_WRONLY) only so the last
+     * byte can be read and a partial write truncated. len 0 writes nothing (or a lone '\n' after a torn tail). */
     int fd = open(path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     struct stat st;
     char        last = '\n';
-    int         rc = fstat(fd, &st) == 0 ? 0 : -1;
+    int         rc = (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) ? 0 : -1;
     if (rc == 0 && st.st_size > 0 && pread(fd, &last, 1, st.st_size - 1) != 1) rc = -1;
-    char *buf = NULL;
-    if (rc == 0 && last != '\n') {
-        if ((buf = malloc(len + 1)) == NULL) {
-            rc = -1;
-        } else {
-            buf[0] = '\n';
-            memcpy(buf + 1, line, len);
-        }
+    if (rc == 0 && last != '\n') rc = write_all(fd, "\n", 1);
+    if (rc == 0) rc = write_all(fd, line, len);
+    if (rc != 0 && st.st_size >= 0 && ftruncate(fd, st.st_size) != 0) {
+        /* best effort: a chattr +a log refuses it, and the next call then ends the partial record */
     }
-    if (rc == 0) rc = buf ? write_all(fd, buf, len + 1) : write_all(fd, line, len);
-    free(buf);
     if (rc == 0 && fsync(fd) != 0) rc = -1;
     if (close(fd) != 0) rc = -1;
     return rc;

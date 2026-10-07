@@ -13,7 +13,8 @@ extern "C" {
  * banners pointed at — so a hardening fix lives in ONE place, not N).
  *
  * Purpose:   crash-safe directory + file primitives — mkdir -p (0700), a temp+fsync+rename atomic
- *            write, an O_APPEND+fsync line append, a size-capped whole-file read (bounds host memory
+ *            write, an O_APPEND+fsync append (and a line-log variant that never glues a record onto a
+ *            torn tail), a size-capped whole-file read (bounds host memory
  *            against an oversized/untrusted file), a no-follow file-size query, a subdirectory listing,
  *            and a UTC timestamp. No
  *            store/JSON/LLM semantics — just bytes + paths.
@@ -37,6 +38,7 @@ int   hc_fs_mkdirs(const char *path);                                      /* mk
 int   hc_fs_atomic_write(const char *path, const char *data, size_t len);  /* temp + fsync + rename   */
 int   hc_fs_append(const char *path, const char *data, size_t len);        /* O_APPEND + fsync, 0600  */
 int   hc_fs_size(const char *path, size_t *size_out);                      /* absent 0, !S_ISREG -1  */
+int   hc_fs_append_line(const char *path, const char *line, size_t len);   /* torn tail -> lead \n    */
 /* Read `path` whole into a malloc'd, NUL-terminated buffer (*len_out = byte length). NULL on error OR
  * when the file exceeds `max_bytes` (the cap bounds host memory against an oversized/planted file). */
 char *hc_fs_read_file(const char *path, size_t max_bytes, size_t *len_out);

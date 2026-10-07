@@ -137,6 +137,36 @@ int main(void)
     CHECK(p != NULL, "reopen after planting a symlink");
     CHECK(p && hc_projects_get(p, "evil-link", &got) != 0, "a planted symlink is NOT adopted as a project");
 
+    /* --- torn tail: a crash or a failed append can leave index.jsonl ending mid-line. The next record must
+     *     not be glued onto it, or replay skips both: a lost tombstone brings a deleted project back, and a
+     *     lost create or rename never happened. Both ways in: a tail found at open, and one left while open. */
+    char idx[1200];
+    snprintf(idx, sizeof idx, "%s/projects/index.jsonl", dir);
+    const char frag[] = "{\"id\":\"half-writ"; /* a line cut off before its '\n' */
+    hc_project g;
+    CHECK(p && hc_projects_create(p, "Gamma", 6000, &g) == 0, "create gamma");
+    hc_projects_close(p);
+    FILE *tf = fopen(idx, "ab");
+    CHECK(tf && fwrite(frag, 1, sizeof frag - 1, tf) == sizeof frag - 1, "plant a torn index tail");
+    if (tf) fclose(tf);
+    p = hc_projects_open(dir);
+    CHECK(p && hc_projects_get(p, "gamma", &got) == 0, "a torn tail does not cost the lines before it");
+    CHECK(p && hc_projects_delete(p, "gamma") == 0, "delete gamma after a torn tail");
+    hc_projects_close(p);
+    p = hc_projects_open(dir);
+    CHECK(p && hc_projects_get(p, "gamma", &got) != 0, "a tombstone written after a torn tail stays deleted");
+    /* now torn while the handle is open; a rename shows the loss (a lost create would be re-adopted from
+     * its dir on reopen, which hides it) */
+    CHECK(p && hc_projects_create(p, "Delta", 7000, &g) == 0, "create delta");
+    tf = fopen(idx, "ab");
+    CHECK(tf && fwrite(frag, 1, sizeof frag - 1, tf) == sizeof frag - 1, "plant a torn tail under an open handle");
+    if (tf) fclose(tf);
+    CHECK(p && hc_projects_rename(p, "delta", "Delta Renamed") == 0, "rename delta after a torn tail");
+    hc_projects_close(p);
+    p = hc_projects_open(dir);
+    CHECK(p && hc_projects_get(p, "delta", &got) == 0 && strcmp(got.display, "Delta Renamed") == 0,
+          "a rename written after a torn tail survives a reopen");
+
     if (p) hc_projects_close(p);
 
     if (g_fail) {

@@ -56,6 +56,19 @@ int main(void)
     CHECK(hc_fs_size(absent, &sz) == 0 && sz == 0, "size of an absent file is 0");
     CHECK(hc_fs_size(sub, &sz) == -1, "size refuses a directory");
 
+    /* append_line: a record after a torn tail (no final '\n') starts on its own line; into a new file or
+     * after a clean tail nothing is added */
+    char llog[1200];
+    snprintf(llog, sizeof llog, "%s/lines.jsonl", sub);
+    CHECK(hc_fs_append_line(llog, "a\n", 2) == 0, "append_line into a new file");
+    CHECK(hc_fs_append(llog, "fr", 2) == 0, "plant a torn tail");
+    CHECK(hc_fs_append_line(llog, "b\n", 2) == 0, "append_line after a torn tail");
+    CHECK(hc_fs_append_line(llog, "c\n", 2) == 0, "append_line after a clean tail");
+    r = hc_fs_read_file(llog, 1024, &n);
+    CHECK(r && n == 9 && memcmp(r, "a\nfr\nb\nc\n", 9) == 0,
+          "append_line ends a torn tail and adds nothing otherwise");
+    free(r);
+
     /* list_dirs sees the subdirectory, not the file */
     char **dirs = NULL;
     size_t nd = 0;
@@ -77,6 +90,7 @@ int main(void)
     CHECK(symlink(vfull, link) == 0, "plant evil_append -> victim/stolen");
     CHECK(hc_fs_append(link, "x", 1) != 0, "append refuses a symlinked target (O_NOFOLLOW)");
     CHECK(hc_fs_size(link, &sz) == -1, "size refuses a symlink (lstat, never followed)");
+    CHECK(hc_fs_append_line(link, "x\n", 2) != 0, "append_line refuses a symlinked target (O_NOFOLLOW)");
     CHECK(access(vfull, F_OK) != 0, "the append did NOT land in the victim dir");
     /* atomic_write THROUGH a planted symlink at <path>.tmp is refused */
     snprintf(link, sizeof link, "%s/evil_atomic", sub);
@@ -107,6 +121,7 @@ int main(void)
     /* tidy */
     unlink(file);
     unlink(log);
+    unlink(llog);
     snprintf(file, sizeof file, "%s/a/b/c", dir); rmdir(file);
     snprintf(file, sizeof file, "%s/a/b", dir);   rmdir(file);
     snprintf(file, sizeof file, "%s/a", dir);     rmdir(file);

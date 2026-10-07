@@ -142,7 +142,7 @@ static int append_line(hc_projects *p, const hc_project *e, int dead)
         if (buf) {
             memcpy(buf, txt, len);
             buf[len] = '\n';
-            rc = hc_fs_append(p->index, buf, len + 1);
+            rc = hc_fs_append_line(p->index, buf, len + 1); /* never glued onto a torn tail */
             free(buf);
         }
     }
@@ -177,7 +177,8 @@ static int replay_cb_line(hc_projects *p, const char *line, size_t len)
     return 0;
 }
 
-/* Replay index.jsonl into the in-memory map (last-wins; torn final line ignored). */
+/* Replay index.jsonl into the in-memory map (last-wins; a torn final line is ignored, and the next
+ * append starts on a fresh line rather than being glued onto it). */
 static void replay_index(hc_projects *p)
 {
     size_t len = 0;

@@ -78,6 +78,36 @@ int hc_fs_append(const char *path, const char *data, size_t len)
     return rc;
 }
 
+int hc_fs_append_line(const char *path, const char *line, size_t len)
+{
+    /* As hc_fs_append, for a newline-delimited log. A crash or a failed append can leave a fragment with no
+     * '\n' at the tail, and appending straight after it would glue this record onto it: a replay that skips
+     * the unparseable result loses the record. So when the last byte is not '\n' the record is written with
+     * a leading '\n', leaving the fragment alone on its own line. For a single-writer log: the check and the
+     * append are two steps. O_RDWR (not O_WRONLY) only so the last byte can be read. */
+    if (len >= SIZE_MAX) return -1;
+    int fd = open(path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    struct stat st;
+    char        last = '\n';
+    int         rc = fstat(fd, &st) == 0 ? 0 : -1;
+    if (rc == 0 && st.st_size > 0 && pread(fd, &last, 1, st.st_size - 1) != 1) rc = -1;
+    char *buf = NULL;
+    if (rc == 0 && last != '\n') {
+        if ((buf = malloc(len + 1)) == NULL) {
+            rc = -1;
+        } else {
+            buf[0] = '\n';
+            memcpy(buf + 1, line, len);
+        }
+    }
+    if (rc == 0) rc = buf ? write_all(fd, buf, len + 1) : write_all(fd, line, len);
+    free(buf);
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    return rc;
+}
+
 int hc_fs_size(const char *path, size_t *size_out)
 {
     /* lstat, not stat: hc_fs_append refuses to write through a symlink, so a symlink here is not the file
